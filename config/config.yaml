@@ -24,20 +24,28 @@ spider:
     platform_a:
       name: "平台A"
       base_url: "https://www.uompld.vip:7988"
-      odds_endpoint: "/odds"
-      login_url: "/login"
+      # 登录页面URL（Next.js前端路由，仅用于页面展示参考）
+      login_url: "/user/login"
+      # 后端登录API接口（JSON API，需要POST JSON数据）
+      # 注意：该平台对密码进行了AES加密 + 浏览器指纹检测，
+      # 简单的API调用可能无法登录成功，推荐使用cookie登录方式
+      login_api: "/site/api/v1/user/login"
+      odds_endpoint: "/site/api/v1/odds"
       timeout: 30
       # 登录凭证（请替换为实际的登录信息）
       credentials:
         username: "hua1212a1"
         password: "baihua920728"
-      # 验证码配置
+      # 验证码配置（该平台使用GeeTest验证码，在需要时动态加载）
       captcha:
-        type: "image"  # image/slide/other
-        retry_limit: 5
-        ocr_enabled: true
-        preprocess: true
-        ocr_config: "--psm 8 --oem 3 -c tessedit_char_whitelist=0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
+        enabled: false  # 无需传统图片验证码
+        type: "none"
+        retry_limit: 3
+      # Cookie登录配置（推荐方式）
+      # 使用方式：在浏览器登录后，通过开发者工具将cookie复制到cookie_file中
+      cookie_login:
+        enabled: true     # 设为true启用cookie登录
+        cookie_file: "data/platform_a_cookies.json"  # cookie文件路径
     platform_b:
       name: "平台B"
       base_url: "https://example-b.com"

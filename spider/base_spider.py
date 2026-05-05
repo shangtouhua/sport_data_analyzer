@@ -14,6 +14,8 @@ import logging
 from bs4 import BeautifulSoup
 import io
 import base64
+import json
+import os
 
 class BaseSpider:
     """
@@ -32,18 +34,28 @@ class BaseSpider:
         self.config = config
         self.logger = logger
         self.session = None
-        self.user_agents = config.get('user_agents', [])
-        self.min_delay = config.get('min_delay', 0.5)
-        self.max_delay = config.get('max_delay', 3.0)
-        self.max_retries = config.get('max_retries', 3)
-        self.retry_delay = config.get('retry_delay', 1.0)
+        # 从config.yaml的spider层级读取配置
+        spider_cfg = config.get('spider', {})
+        self.user_agents = spider_cfg.get('user_agents', [])
+        self.min_delay = spider_cfg.get('min_delay', 0.5)
+        self.max_delay = spider_cfg.get('max_delay', 3.0)
+        self.max_retries = spider_cfg.get('max_retries', 3)
+        self.retry_delay = spider_cfg.get('retry_delay', 1.0)
         # 登录状态管理
         self.is_logged_in = False
         self.login_cookies = None
+        self.login_token = None
 
     async def __aenter__(self):
         """异步上下文管理器入口"""
         self.session = aiohttp.ClientSession()
+
+        # 尝试从文件加载cookie（如果配置了cookie登录）
+        cookie_loaded = await self._try_load_cookies_from_file()
+        if cookie_loaded:
+            self.is_logged_in = True
+            self.logger.info("从文件加载cookie成功，跳过API登录")
+
         return self
 
     async def __aexit__(self, exc_type, exc_val, exc_tb):
@@ -53,6 +65,54 @@ class BaseSpider:
         # 重置登录状态
         self.is_logged_in = False
         self.login_cookies = None
+        self.login_token = None
+
+    async def _try_load_cookies_from_file(self) -> bool:
+        """
+        尝试从配置文件指定的路径加载cookie
+
+        Returns:
+            cookie是否加载成功
+        """
+        try:
+            platform_config = self.config.get('spider', {}).get('platforms', {}).get('platform_a', {})
+            cookie_config = platform_config.get('cookie_login', {})
+            if not cookie_config.get('enabled', False):
+                return False
+
+            cookie_file = cookie_config.get('cookie_file', '')
+            if not cookie_file:
+                return False
+
+            cookie_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), cookie_file)
+            if not os.path.exists(cookie_path):
+                self.logger.warning(f"Cookie文件不存在: {cookie_path}")
+                self.logger.info("请先在浏览器登录，然后导出cookie到该文件")
+                return False
+
+            with open(cookie_path, 'r', encoding='utf-8') as f:
+                cookies_data = json.load(f)
+
+            # 将cookie注入到session中
+            base_url = platform_config.get('base_url', '')
+            for cookie in cookies_data:
+                if isinstance(cookie, dict):
+                    name = cookie.get('name', '')
+                    value = cookie.get('value', '')
+                    domain = cookie.get('domain', 'www.uompld.vip')
+                    if name and value:
+                        self.session.cookie_jar.update_cookies(
+                            {name: value},
+                            response_url=base_url
+                        )
+
+            self.login_cookies = self.session.cookie_jar
+            self.logger.info(f"已从文件加载 {len(cookies_data)} 个cookie")
+            return True
+
+        except Exception as e:
+            self.logger.warning(f"加载cookie文件失败: {str(e)}")
+            return False
 
     def get_random_headers(self) -> Dict[str, str]:
         """
@@ -61,8 +121,9 @@ class BaseSpider:
         Returns:
             包含随机User-Agent的请求头字典
         """
+        user_agent = random.choice(self.user_agents) if self.user_agents else 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
         headers = {
-            'User-Agent': random.choice(self.user_agents),
+            'User-Agent': user_agent,
             'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
             'Accept-Language': 'zh-CN,zh;q=0.8,zh-TW;q=0.7,zh-HK;q=0.5,en-US;q=0.3,en;q=0.2',
             'Accept-Encoding': 'gzip, deflate',
@@ -196,10 +257,10 @@ class BaseSpider:
     async def login(self, login_url: str, credentials: Dict[str, str],
                    captcha_config: Optional[Dict[str, Any]] = None) -> bool:
         """
-        处理登录流程
+        处理登录流程（通用入口，自动选择登录方式）
 
         Args:
-            login_url: 登录页面URL
+            login_url: 登录页面URL或登录API URL
             credentials: 登录凭证，包含username和password
             captcha_config: 验证码配置
 
@@ -209,28 +270,16 @@ class BaseSpider:
         try:
             self.logger.info(f"开始登录: {login_url}")
 
-            # 获取登录页面，提取CSRF token等信息
-            login_page = await self.fetch_page(login_url)
-            if not login_page:
-                self.logger.error("获取登录页面失败")
-                return False
+            # 判断登录方式：如果配置了login_api字段，使用JSON API方式登录
+            platform_config = self.config.get('spider', {}).get('platforms', {}).get('platform_a', {})
+            login_api = platform_config.get('login_api', '')
 
-            # 解析登录页面
-            soup = self.parse_html(login_page)
-
-            # 处理验证码（如果存在）
-            captcha_solution = None
-            if captcha_config and captcha_config.get('type') == 'image':
-                captcha_solution = await self._handle_image_captcha(soup, captcha_config)
-                if not captcha_solution:
-                    self.logger.error("验证码识别失败")
-                    return False
-
-            # 准备登录数据
-            login_data = self._prepare_login_data(soup, credentials, captcha_solution)
-
-            # 提交登录表单
-            success = await self._submit_login_form(login_url, login_data)
+            if login_api:
+                full_login_api = f"{platform_config.get('base_url', '')}{login_api}"
+                success = await self._api_json_login(full_login_api, credentials)
+            else:
+                # 传统表单登录方式（兼容旧版）
+                success = await self._form_login(login_url, credentials, captcha_config)
 
             if success:
                 self.is_logged_in = True
@@ -242,6 +291,98 @@ class BaseSpider:
 
         except Exception as e:
             self.logger.error(f"登录过程发生异常: {str(e)}")
+            return False
+
+    async def _api_json_login(self, login_api_url: str, credentials: Dict[str, str]) -> bool:
+        """
+        使用JSON API方式登录（适用于现代Next.js/React SPA网站）
+
+        Args:
+            login_api_url: 登录API的完整URL
+            credentials: 登录凭证
+
+        Returns:
+            登录是否成功
+        """
+        try:
+            self.logger.info(f"使用API登录: {login_api_url}")
+
+            login_data = {
+                'username': credentials.get('username', ''),
+                'password': credentials.get('password', ''),
+                'Kaptchcate': 99  # 99表示跳过验证码
+            }
+
+            headers = self.get_random_headers()
+            base_url = self.config.get('spider', {}).get('platforms', {}).get('platform_a', {}).get('base_url', '')
+            headers.update({
+                'Content-Type': 'application/json',
+                'Accept': 'application/json, text/plain, */*',
+                'Referer': f'{base_url}/user/login'
+            })
+
+            async with self.session.post(login_api_url, json=login_data, headers=headers) as response:
+                if response.status == 200:
+                    resp_data = await response.json()
+                    self.logger.debug(f"登录API响应: {resp_data}")
+
+                    status_code = resp_data.get('status_code')
+                    if status_code in (0, 200):
+                        self.login_cookies = response.cookies
+                        data = resp_data.get('data', {})
+                        if data:
+                            self.login_token = data.get('token', '')
+                        return True
+                    else:
+                        error_msg = resp_data.get('message', '登录失败')
+                        self.logger.error(f"登录API返回错误: {error_msg} (code: {status_code})")
+                        return False
+                else:
+                    self.logger.error(f"登录API请求失败，状态码: {response.status}")
+                    return False
+
+        except aiohttp.ContentTypeError:
+            self.logger.error("登录API响应不是有效的JSON格式")
+            return False
+        except Exception as e:
+            self.logger.error(f"API登录过程发生异常: {str(e)}")
+            return False
+
+    async def _form_login(self, login_url: str, credentials: Dict[str, str],
+                         captcha_config: Optional[Dict[str, Any]] = None) -> bool:
+        """
+        传统表单登录方式（适用于传统HTML表单网站）
+
+        Args:
+            login_url: 登录页面URL
+            credentials: 登录凭证
+            captcha_config: 验证码配置
+
+        Returns:
+            登录是否成功
+        """
+        try:
+            self.logger.info(f"使用表单登录: {login_url}")
+
+            login_page = await self.fetch_page(login_url)
+            if not login_page:
+                self.logger.error("获取登录页面失败")
+                return False
+
+            soup = self.parse_html(login_page)
+
+            captcha_solution = None
+            if captcha_config and captcha_config.get('type') == 'image':
+                captcha_solution = await self._handle_image_captcha(soup, captcha_config)
+                if not captcha_solution:
+                    self.logger.error("验证码识别失败")
+                    return False
+
+            login_data = self._prepare_login_data(soup, credentials, captcha_solution)
+            return await self._submit_login_form(login_url, login_data)
+
+        except Exception as e:
+            self.logger.error(f"表单登录过程发生异常: {str(e)}")
             return False
 
     async def _handle_image_captcha(self, soup: BeautifulSoup,
@@ -533,22 +674,27 @@ class BaseSpider:
             if not self.is_logged_in:
                 return False
 
+            # 如果有login_token，尝试通过API验证
+            if self.login_token:
+                self.logger.info("使用token验证登录状态")
+                return True  # token存在说明已登录
+
             # 如果没有提供检查URL，使用一个需要登录的页面
             if not check_url:
-                check_url = self.config.get('platform_a', {}).get('base_url', '') + '/profile'
+                platform_cfg = self.config.get('spider', {}).get('platforms', {}).get('platform_a', {})
+                check_url = platform_cfg.get('base_url', '')
 
             # 发送请求检查登录状态
             headers = self.get_random_headers()
-            if self.login_cookies:
-                # 使用登录时保存的cookies
-                cookies = {cookie.key: cookie.value for cookie in self.login_cookies}
 
-            async with self.session.get(check_url, headers=headers, cookies=cookies) as response:
-                if response.status == 200:
-                    content = await response.text()
-                    # 检查页面是否包含登录相关内容
-                    return not any(indicator in content.lower()
-                                 for indicator in ['login', '登录', 'sign in'])
+            async with self.session.get(check_url, headers=headers, allow_redirects=False) as response:
+                # 如果登录成功，访问受保护页面不会重定向到登录页
+                # 如果返回302重定向（到登录页），说明cookie已失效
+                if response.status in (200, 304):
+                    return True
+                elif response.status == 302:
+                    self.logger.warning("cookie已失效，需要重新登录")
+                    return False
                 else:
                     return False
 

@@ -31,6 +31,7 @@ class PlatformAParser(BaseSpider):
         platform_config = config.get('spider', {}).get('platforms', {}).get('platform_a', {})
         self.base_url = platform_config.get('base_url', '')
         self.login_url = platform_config.get('login_url', '')
+        self.login_api = platform_config.get('login_api', '')
         self.odds_endpoint = platform_config.get('odds_endpoint', '')
 
         # 登录凭证
@@ -39,8 +40,8 @@ class PlatformAParser(BaseSpider):
         # 验证码配置
         self.captcha_config = platform_config.get('captcha', {})
 
-        # 完整的URL
-        self.full_login_url = f"{self.base_url}{self.login_url}"
+        # 完整的URL（优先使用login_api，回退到login_url）
+        self.full_login_url = f"{self.base_url}{self.login_api}" if self.login_api else f"{self.base_url}{self.login_url}"
         self.full_odds_url = f"{self.base_url}{self.odds_endpoint}"
 
     def extract_match_info(self, soup: BeautifulSoup) -> List[Dict[str, Any]]:
@@ -273,9 +274,19 @@ class PlatformAParser(BaseSpider):
         Returns:
             是否成功登录
         """
-        # 检查是否需要登录凭证
+        # 如果已经通过cookie登录，直接验证登录状态
+        if self.is_logged_in:
+            return await self.ensure_login(
+                login_url=self.full_login_url,
+                credentials=self.credentials if self.credentials.get('username') else {},
+                captcha_config=self.captcha_config,
+                max_retries=self.captcha_config.get('retry_limit', 3)
+            )
+
+        # 需要登录凭证进行API登录
         if not self.credentials.get('username') or not self.credentials.get('password'):
             self.logger.error("缺少登录凭证，无法登录")
+            self.logger.info("请在浏览器登录后导出cookie到 data/platform_a_cookies.json")
             return False
 
         # 确保登录状态
