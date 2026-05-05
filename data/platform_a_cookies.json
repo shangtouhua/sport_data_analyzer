@@ -1,0 +1,14 @@
+[
+    {
+        "name": "token",
+        "value": "your_token_value_here",
+        "domain": "www.uompld.vip",
+        "path": "/"
+    },
+    {
+        "name": "PHPSESSID",
+        "value": "your_session_id_here",
+        "domain": "www.uompld.vip",
+        "path": "/"
+    }
+]
