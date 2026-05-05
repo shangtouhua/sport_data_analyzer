@@ -1,0 +1,23 @@
+2026-05-04 18:44:54 - odds_spider - INFO - 初始化数据库表...
+2026-05-04 18:44:54 - odds_spider - INFO - 数据库初始化成功
+2026-05-04 18:44:54 - odds_spider - INFO - 数据库索引创建成功
+2026-05-04 18:44:54 - odds_spider - INFO - 组件初始化完成
+2026-05-04 18:44:54 - odds_spider - INFO - 开始新的数据采集周期
+2026-05-04 18:44:54 - odds_spider - INFO - 开始爬取平台数据: 平台A
+2026-05-04 18:52:45 - odds_spider - INFO - 组件初始化完成
+2026-05-04 18:52:45 - odds_spider - INFO - 开始新的数据采集周期
+2026-05-04 18:52:45 - odds_spider - INFO - 开始爬取平台数据: 平台A
+2026-05-04 18:54:01 - odds_spider - INFO - 组件初始化完成
+2026-05-04 18:54:01 - odds_spider - INFO - 开始新的数据采集周期
+2026-05-04 18:54:01 - odds_spider - INFO - 开始爬取平台数据: 平台A
+2026-05-04 18:54:01 - odds_spider - INFO - 组件初始化完成
+2026-05-04 18:54:01 - odds_spider - INFO - 开始新的数据采集周期
+2026-05-04 18:54:01 - odds_spider - INFO - 开始爬取平台数据: 平台A
+2026-05-04 18:54:06 - odds_spider - INFO - 成功爬取 0 场比赛数据
+2026-05-04 18:54:06 - odds_spider - INFO - 开始爬取平台数据: 平台B
+2026-05-04 18:54:06 - odds_spider - INFO - 成功爬取 0 场比赛数据
+2026-05-04 18:54:06 - odds_spider - INFO - 开始爬取平台数据: 平台B
+2026-05-04 18:54:08 - odds_spider - ERROR - 客户端错误: https://example-b.com/sports/odds, 错误: Cannot connect to host example-b.com:443 ssl:default [nodename nor servname provided, or not known]
+2026-05-04 18:54:08 - odds_spider - ERROR - 客户端错误: https://example-b.com/sports/odds, 错误: Cannot connect to host example-b.com:443 ssl:default [nodename nor servname provided, or not known]
+2026-05-04 18:54:11 - odds_spider - ERROR - 客户端错误: https://example-b.com/sports/odds, 错误: Cannot connect to host example-b.com:443 ssl:default [nodename nor servname provided, or not known]
+2026-05-04 18:54:12 - odds_spider - ERROR - 客户端错误: https://example-b.com/sports/odds, 错误: Cannot connect to host example-b.com:443 ssl:default [nodename nor servname provided, or not known]

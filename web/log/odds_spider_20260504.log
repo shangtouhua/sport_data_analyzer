@@ -1,0 +1,28 @@
+2026-05-04 19:57:02 - odds_spider - INFO - 创建数据库目录: data
+2026-05-04 19:57:02 - odds_spider - INFO - 初始化数据库表...
+2026-05-04 19:57:02 - odds_spider - INFO - 数据库初始化成功
+2026-05-04 19:57:02 - odds_spider - INFO - 数据库索引创建成功
+2026-05-04 19:57:02 - odds_spider - INFO - 组件初始化完成
+2026-05-04 19:57:02 - odds_spider - INFO - 开始新的数据采集周期
+2026-05-04 19:57:02 - odds_spider - ERROR - 平台配置缺失: platform_a
+2026-05-04 19:57:02 - odds_spider - ERROR - 平台配置缺失: platform_b
+2026-05-04 19:57:02 - odds_spider - INFO - 开始匹配赛事: 平台A 0 场, 平台B 0 场
+2026-05-04 19:57:02 - odds_spider - INFO - 匹配完成: 成功 0 对, 匹配率 0.0%
+2026-05-04 19:57:02 - odds_spider - INFO - 采集周期完成: 发现 0 个套利机会
+2026-05-04 19:57:02 - odds_spider - ERROR - 查询执行失败: 
+            SELECT
+                mi.match_id, mi.league_name, mi.home_team, mi.away_team,
+                mi.match_time, mi.match_status,
+                or.platform, or.home_win_odds, or.draw_odds, or.away_win_odds,
+                or.big_ball_odds, or.small_ball_odds, or.handicap, or.collect_time
+            FROM match_info mi
+            INNER JOIN odds_record or ON mi.match_id = or.match_id
+            WHERE mi.match_status IN ('未开始', '进行中')
+             ORDER BY mi.match_time DESC, or.collect_time DESC LIMIT ?, 错误: near "or": syntax error
+2026-05-04 19:57:05 - odds_spider - INFO - 组件初始化完成
+2026-05-04 19:57:05 - odds_spider - INFO - 开始新的数据采集周期
+2026-05-04 19:57:05 - odds_spider - ERROR - 平台配置缺失: platform_a
+2026-05-04 19:57:05 - odds_spider - ERROR - 平台配置缺失: platform_b
+2026-05-04 19:57:05 - odds_spider - INFO - 开始匹配赛事: 平台A 0 场, 平台B 0 场
+2026-05-04 19:57:05 - odds_spider - INFO - 匹配完成: 成功 0 对, 匹配率 0.0%
+2026-05-04 19:57:05 - odds_spider - INFO - 采集周期完成: 发现 0 个套利机会

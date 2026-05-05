@@ -1,0 +1,16 @@
+# Python package requirements for odds arbitrage tool
+aiohttp==3.9.1
+beautifulsoup4==4.12.2
+playwright==1.40.0
+pyyaml==6.0
+fuzzywuzzy==0.18.0
+python-levenshtein==0.21.0
+
+# 验证码识别相关依赖
+pytesseract==0.3.10  # OCR文字识别
+Pillow==10.1.0       # 图片处理
+opencv-python==4.8.1.78  # 图像处理（可选）
+
+# 开发工具（可选）
+black==23.11.0  # 代码格式化
+pytest==7.4.3   # 单元测试

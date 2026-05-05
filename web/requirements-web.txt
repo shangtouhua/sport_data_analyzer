@@ -1,0 +1,18 @@
+# Web监控界面依赖包
+
+# Flask Web框架
+Flask==2.3.3
+Flask-CORS==4.0.0
+Flask-SocketIO==5.3.6
+python-socketio==5.8.0
+
+# Werkzeug (Flask依赖)
+Werkzeug==2.3.7
+
+# 异步支持
+python-engineio==4.7.1
+
+# 开发工具
+click==8.1.7
+itsdangerous==2.1.2
+MarkupSafe==2.1.3
