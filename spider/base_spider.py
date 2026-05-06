@@ -18,6 +18,7 @@ import json
 import os
 import tempfile
 
+from yarl import URL
 from .captcha_solver import ClickCaptchaSolver
 
 class BaseSpider:
@@ -97,42 +98,48 @@ class BaseSpider:
             with open(cookie_path, 'r', encoding='utf-8') as f:
                 cookies_data = json.load(f)
 
-            # 检测无效cookie（占位符值）
+            # 过滤无效cookie（占位符值），只加载有效的cookie
             placeholder_patterns = ['your_', 'replace_', 'placeholder', 'xxx', 'here']
-            invalid_cookies = []
+            valid_cookies = []
+            skipped_cookies = []
             for c in cookies_data:
                 if isinstance(c, dict):
                     val = c.get('value', '')
                     if any(p in val.lower() for p in placeholder_patterns):
-                        invalid_cookies.append(c.get('name', 'unknown'))
+                        skipped_cookies.append(c.get('name', 'unknown'))
+                    else:
+                        valid_cookies.append(c)
 
-            if invalid_cookies:
-                self.logger.error(f"Cookie文件包含无效的占位符值: {invalid_cookies}")
+            if skipped_cookies:
+                self.logger.warning(f"跳过含占位符的cookie: {skipped_cookies}")
+
+            if not valid_cookies:
+                self.logger.error("Cookie文件中所有cookie均为占位符值，无法使用")
                 self.logger.error("请在浏览器登录后，重新导出真实的cookie到 data/platform_a_cookies.json")
                 self.logger.error("运行以下命令获取帮助: python tools/extract_cookies.py")
                 return False
 
             # 检测合并cookie（一个cookie值包含多个键值对）
-            for c in cookies_data:
-                if isinstance(c, dict) and '; ' in c.get('value', ''):
+            for c in valid_cookies:
+                if '; ' in c.get('value', ''):
                     self.logger.warning(
                         f"Cookie '{c.get('name')}' 包含合并的cookie值（含有'; '分隔符），"
                         f"应拆分为独立cookie条目"
                     )
 
-            # 将cookie注入到session中
-            base_url = platform_config.get('base_url', '')
+            # 将有效cookie注入到session中
+            base_url_str = platform_config.get('base_url', '')
+            base_url = URL(base_url_str) if base_url_str else URL()
             loaded_count = 0
-            for cookie in cookies_data:
-                if isinstance(cookie, dict):
-                    name = cookie.get('name', '')
-                    value = cookie.get('value', '')
-                    if name and value:
-                        self.session.cookie_jar.update_cookies(
-                            {name: value},
-                            response_url=base_url
-                        )
-                        loaded_count += 1
+            for cookie in valid_cookies:
+                name = cookie.get('name', '')
+                value = cookie.get('value', '')
+                if name and value:
+                    self.session.cookie_jar.update_cookies(
+                        {name: value},
+                        response_url=base_url
+                    )
+                    loaded_count += 1
 
             # 从cookie中提取login_token（X-API-TOKEN）
             for cookie in cookies_data:
@@ -171,6 +178,27 @@ class BaseSpider:
             if not base_url:
                 return False
 
+            # 优先使用配置的验证端点（如果存在），避免SPA首页误判
+            verify_endpoint = platform_config.get('login_verify_endpoint', '')
+            verify_header_name = platform_config.get('login_verify_header', 'X-API-TOKEN')
+            if verify_endpoint:
+                verify_url = f"{base_url}{verify_endpoint}" if not verify_endpoint.startswith('http') else verify_endpoint
+                self.logger.info(f"使用配置的验证端点检查登录状态: {verify_endpoint}")
+                v_headers = self.get_random_headers()
+                if self.login_token:
+                    v_headers[verify_header_name] = self.login_token
+                try:
+                    async with self.session.get(
+                        verify_url, headers=v_headers, allow_redirects=False, timeout=15
+                    ) as v_resp:
+                        if v_resp.status in (401, 403, 302, 301):
+                            self.logger.warning(f"验证端点返回状态码 {v_resp.status}，Cookie可能已失效")
+                        else:
+                            self.logger.info("验证端点状态正常，Cookie有效")
+                            return True
+                except Exception as e:
+                    self.logger.warning(f"验证端点请求失败: {e}，回退到页面扫描")
+
             headers = self.get_random_headers()
             headers['Accept'] = 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8'
 
@@ -187,12 +215,29 @@ class BaseSpider:
                     return False
 
                 body = await response.text()
-                login_indicators = ['登录', 'login', 'signin', '登录', '用户登录']
-                for indicator in login_indicators:
-                    if indicator in body[:2000]:
-                        self.logger.warning("Cookie无效：返回页面包含登录表单")
+
+                # 精确检测：查找登录表单元素（密码输入框是登录页面的强信号）
+                # SPA 首页导航栏可能包含"登录"文字，但不会有密码输入框
+                has_password_field = 'input type="password"' in body or 'type="password"' in body
+                if has_password_field:
+                    self.logger.warning("Cookie无效：页面包含密码输入框，未登录")
+                    return False
+
+                # 检测页面标题是否包含"登录"（比正文更可靠）
+                title_match = __import__('re').search(r'<title[^>]*>(.*?)</title>', body, __import__('re').IGNORECASE)
+                if title_match:
+                    title_text = title_match.group(1)
+                    if any(kw in title_text for kw in ['登录', 'login', '用户登录']):
+                        self.logger.warning(f"Cookie无效：页面标题包含登录关键词 '{title_text}'")
                         return False
 
+                # 检测已登录状态关键词（后台/管理页面特征）
+                logged_in_keywords = ['我的账户', '个人中心', '控制台', '仪表盘', '我的投注', '账户余额']
+                if any(kw in body[:2000] for kw in logged_in_keywords):
+                    self.logger.info("检测到已登录状态关键词")
+                    return True
+
+                self.logger.info("Cookie验证通过（未检测到登录表单）")
                 return True
 
         except Exception as e:
@@ -795,13 +840,14 @@ class BaseSpider:
                 await page.goto(login_url, wait_until='networkidle', timeout=60000)
                 await page.wait_for_timeout(2000)
 
-                # 尝试自动填写登录表单
+                # === 第1步：尝试自动填写登录表单（扩展多种选择器） ===
                 auto_filled = False
-                selectors = [
-                    'input[placeholder*="账号" i], input[placeholder*="用户" i], input[name="username"], input[name="account"]',
-                    'input[type="text"]',
+                username_selectors = [
+                    'input[placeholder*="账号" i], input[placeholder*="用户" i], input[placeholder*="手机" i], input[placeholder*="邮箱" i], input[placeholder*="email" i]',
+                    'input[name="username"], input[name="account"], input[name="phone"], input[name="email"], input[autocomplete="username"]',
+                    'input[id*="username"], input[id*="account"], input[id*="phone"], input[id*="email"]',
                 ]
-                for sel in selectors:
+                for sel in username_selectors:
                     try:
                         inp = await page.wait_for_selector(sel, timeout=5000)
                         if inp:
@@ -812,8 +858,27 @@ class BaseSpider:
                     except Exception:
                         continue
 
+                # 智能回退：遍历可见非密码输入框，跳过搜索框
+                if not auto_filled:
+                    try:
+                        all_inputs = await page.query_selector_all(
+                            'input:not([type="password"]):not([type="hidden"]):not([type="checkbox"]):not([type="radio"])'
+                        )
+                        for inp in all_inputs:
+                            if not await inp.is_visible():
+                                continue
+                            ph = (await inp.get_attribute('placeholder') or '').lower()
+                            if any(kw in ph for kw in ['搜索', 'search', '查找', 'query']):
+                                continue
+                            await inp.fill(credentials.get('username', ''))
+                            self.logger.info(f"已自动填写用户名 (智能回退)")
+                            auto_filled = True
+                            break
+                    except Exception:
+                        pass
+
                 password_selectors = [
-                    'input[placeholder*="密码" i], input[name="password"]',
+                    'input[placeholder*="密码" i], input[name="password"], input[autocomplete="current-password"]',
                     'input[type="password"]',
                 ]
                 pw_filled = False
@@ -828,9 +893,33 @@ class BaseSpider:
                     except Exception:
                         continue
 
-                if auto_filled and pw_filled:
-                    await page.wait_for_timeout(500)
-                    # 尝试点击登录按钮
+                await page.wait_for_timeout(500)
+
+                # === 第2步：检测并处理验证码（独立于自动填写结果） ===
+                user_already_logged_in = False
+
+                # GeeTest 行为验证码（滑块拼图）
+                self.logger.info("检测GeeTest验证码...")
+                if '/user/login' not in page.url:
+                    self.logger.info("用户已登录，跳过GeeTest验证码处理")
+                    user_already_logged_in = True
+                else:
+                    captcha_passed = await self._detect_and_solve_geetest(page)
+                    if not captcha_passed:
+                        self.logger.warning("GeeTest验证码处理未完成，但仍尝试等待登录")
+
+                # 点击式验证码（OCR + 顺序点击）
+                if '/user/login' not in page.url:
+                    self.logger.info("检测到用户已登录，跳过后续验证码处理")
+                    user_already_logged_in = True
+                else:
+                    self.logger.info("检测点击式验证码...")
+                    click_captcha_passed = await self._detect_and_solve_click_captcha(page)
+                    if not click_captcha_passed:
+                        self.logger.warning("点击式验证码处理未完成，但仍尝试等待登录")
+
+                if not user_already_logged_in:
+                    # === 第3步：点击登录按钮或等待手动登录 ===
                     btn_selectors = [
                         'button[type="submit"]',
                         'button:has-text("登录")',
@@ -839,84 +928,73 @@ class BaseSpider:
                         '.login-btn',
                         '.submit-btn',
                     ]
-                    clicked = False
-                    for sel in btn_selectors:
-                        btn = await page.query_selector(sel)
-                        if btn:
-                            await btn.click()
-                            self.logger.info("已点击登录按钮")
-                            clicked = True
-                            break
-                    if not clicked:
-                        self.logger.warning("未找到登录按钮，尝试Enter提交")
-                        await page.keyboard.press('Enter')
 
-                    # 检测并处理 GeeTest 行为验证码（滑块拼图）
-                    self.logger.info("检测GeeTest验证码...")
-                    captcha_passed = await self._detect_and_solve_geetest(page)
+                    if auto_filled and pw_filled:
+                        # 尝试点击登录按钮
+                        clicked = False
+                        for sel in btn_selectors:
+                            btn = await page.query_selector(sel)
+                            if btn:
+                                await btn.click()
+                                self.logger.info("已点击登录按钮")
+                                clicked = True
+                                break
+                        if not clicked:
+                            self.logger.warning("未找到登录按钮，尝试Enter提交")
+                            await page.keyboard.press('Enter')
 
-                    if not captcha_passed:
-                        self.logger.warning("GeeTest验证码处理未完成，但仍尝试等待登录")
+                        # 部分平台的验证码通过后需再次点击登录按钮
+                        try:
+                            still_on_login = '/user/login' in page.url
+                            if still_on_login:
+                                self.logger.info("验证码已处理完成，再次点击登录按钮...")
+                                for sel in btn_selectors:
+                                    btn = await page.query_selector(sel)
+                                    if btn and await btn.is_enabled():
+                                        await btn.click()
+                                        self.logger.info("已重新点击登录按钮")
+                                        break
+                        except Exception:
+                            pass
 
-                    # 检测并处理点击式文字验证码（OCR + 顺序点击）
-                    self.logger.info("检测点击式验证码...")
-                    click_captcha_passed = await self._detect_and_solve_click_captcha(page)
+                        self.logger.info("等待登录完成（15秒）...")
+                        try:
+                            await page.wait_for_url(
+                                lambda url: '/user/login' not in url,
+                                timeout=15000
+                            )
+                        except Exception:
+                            pass
+                    else:
+                        self.logger.warning("自动填写未完全成功，请手动在浏览器中完成登录")
+                        self.logger.info("请在浏览器窗口中手动输入账号密码并登录，系统将自动处理验证码")
+                        self.logger.info("等待手动登录（最多90秒）...")
+                        try:
+                            await page.wait_for_url(
+                                lambda url: '/user/login' not in url,
+                                timeout=90000
+                            )
+                        except Exception:
+                            pass
 
-                    if not click_captcha_passed:
-                        self.logger.warning("点击式验证码处理未完成，但仍尝试等待登录")
+                    await page.wait_for_timeout(2000)
 
-                    # 部分平台的验证码通过后仍需再次点击登录按钮
-                    try:
-                        still_on_login = '/user/login' in page.url
-                        if still_on_login:
-                            self.logger.info("验证码已通过，再次点击登录按钮...")
-                            for sel in btn_selectors:
-                                btn = await page.query_selector(sel)
-                                if btn and await btn.is_enabled():
-                                    await btn.click()
-                                    self.logger.info("已重新点击登录按钮")
-                                    break
-                    except Exception:
-                        pass
+                    # 检查登录是否成功
+                    current_url = page.url
+                    if '/user/login' in current_url:
+                        self.logger.error("Playwright登录失败：仍然停留在登录页面")
+                        try:
+                            error_text = await page.text_content(
+                                '.error-message, .el-message, [class*="error"], .message, .tip'
+                            )
+                            if error_text and error_text.strip():
+                                self.logger.error(f"页面错误提示: {error_text.strip()}")
+                        except Exception:
+                            pass
+                        await browser.close()
+                        return False
 
-                    self.logger.info("等待登录完成（15秒）...")
-                    try:
-                        await page.wait_for_url(
-                            lambda url: '/user/login' not in url,
-                            timeout=15000
-                        )
-                    except Exception:
-                        pass
-                else:
-                    self.logger.warning("自动填写未完全成功，请手动在浏览器中完成登录")
-                    self.logger.info("请在浏览器窗口中手动输入账号密码并登录")
-                    self.logger.info("等待手动登录（最多90秒）...")
-                    try:
-                        await page.wait_for_url(
-                            lambda url: '/user/login' not in url,
-                            timeout=90000
-                        )
-                    except Exception:
-                        pass
-
-                await page.wait_for_timeout(2000)
-
-                # 检查登录是否成功
-                current_url = page.url
-                if '/user/login' in current_url:
-                    self.logger.error("Playwright登录失败：仍然停留在登录页面")
-                    try:
-                        error_text = await page.text_content(
-                            '.error-message, .el-message, [class*="error"], .message, .tip'
-                        )
-                        if error_text and error_text.strip():
-                            self.logger.error(f"页面错误提示: {error_text.strip()}")
-                    except Exception:
-                        pass
-                    await browser.close()
-                    return False
-
-                self.logger.info(f"Playwright登录成功，当前URL: {current_url}")
+                self.logger.info("Playwright登录成功，当前URL: {}".format(page.url))
 
                 # 从浏览器上下文获取cookies
                 browser_cookies = await context.cookies()
@@ -926,7 +1004,7 @@ class BaseSpider:
                 for cookie in browser_cookies:
                     self.session.cookie_jar.update_cookies(
                         {cookie['name']: cookie['value']},
-                        response_url=base_url
+                        response_url=URL(base_url)
                     )
                     if cookie['name'] == 'X-API-TOKEN':
                         self.login_token = cookie['value']
@@ -1185,18 +1263,26 @@ class BaseSpider:
         """
         等待用户手动完成 GeeTest 验证码
 
-        轮询检测 GeeTest 面板状态，直到验证通过或超时。
+        轮询检测 GeeTest 面板状态，直到验证通过、用户已登录（URL变化）或超时。
 
         Args:
             page: Playwright 页面对象
             timeout: 超时时间（秒）
 
         Returns:
-            bool: 是否已完成验证
+            bool: 是否已完成验证/登录
         """
         try:
             start_wait = time.time()
             while time.time() - start_wait < timeout:
+                # 检测用户是否已登录（URL已离开登录页）
+                try:
+                    if '/user/login' not in page.url:
+                        self.logger.info("检测到用户已登录，退出验证码等待")
+                        return True
+                except Exception:
+                    pass
+
                 solved = await page.evaluate("""
                     () => {
                         const panel = document.querySelector('.geetest_panel');
@@ -1269,13 +1355,36 @@ class BaseSpider:
             if not self.is_logged_in:
                 return False
 
+            platform_config = self.config.get('spider', {}).get('platforms', {}).get('platform_a', {})
+            base_url = platform_config.get('base_url', '')
+            verify_endpoint = platform_config.get('login_verify_endpoint', '')
+            verify_header_name = platform_config.get('login_verify_header', 'X-API-TOKEN')
+
+            # 优先使用配置的验证端点（如果存在）
+            if verify_endpoint:
+                verify_url = f"{base_url}{verify_endpoint}" if not verify_endpoint.startswith('http') else verify_endpoint
+                self.logger.info(f"使用配置的验证端点: {verify_endpoint}")
+                v_headers = self.get_random_headers()
+                if self.login_token:
+                    v_headers[verify_header_name] = self.login_token
+                try:
+                    async with self.session.get(
+                        verify_url, headers=v_headers, allow_redirects=False, timeout=15
+                    ) as v_resp:
+                        if v_resp.status in (401, 403, 302, 301):
+                            self.logger.warning(f"验证端点返回状态码 {v_resp.status}，登录状态已失效")
+                            return False
+                        if v_resp.status == 200:
+                            self.logger.info("验证端点确认登录状态正常")
+                            return True
+                except Exception as e:
+                    self.logger.warning(f"验证端点请求失败: {e}，回退到token/页面检查")
+
             # 如果有login_token，验证其有效性
             if self.login_token:
                 self.logger.info("使用token验证登录状态")
-                platform_config = self.config.get('spider', {}).get('platforms', {}).get('platform_a', {})
-                base_url = platform_config.get('base_url', '')
                 headers = self.get_random_headers()
-                headers['X-API-TOKEN'] = self.login_token
+                headers[verify_header_name] = self.login_token
                 try:
                     async with self.session.get(
                         base_url, headers=headers, allow_redirects=False, timeout=15
@@ -1298,11 +1407,23 @@ class BaseSpider:
             async with self.session.get(check_url, headers=headers, allow_redirects=False) as response:
                 if response.status in (200, 304):
                     body = await response.text()
-                    login_indicators = ['登录', 'login', 'signin', '用户登录']
-                    for indicator in login_indicators:
-                        if indicator in body[:2000]:
-                            self.logger.warning("登录状态无效：返回页面包含登录表单")
+                    # 精确检测登录表单（SPA首页导航栏的"登录"文字不应误判）
+                    has_password_field = 'input type="password"' in body or 'type="password"' in body
+                    if has_password_field:
+                        self.logger.warning("登录状态无效：页面包含密码输入框")
+                        return False
+                    # 检测页面标题
+                    title_match = __import__('re').search(r'<title[^>]*>(.*?)</title>', body, __import__('re').IGNORECASE)
+                    if title_match:
+                        title_text = title_match.group(1)
+                        if any(kw in title_text for kw in ['登录', 'login', '用户登录']):
+                            self.logger.warning(f"登录状态无效：页面标题包含登录关键词 '{title_text}'")
                             return False
+                    # 检测已登录状态关键词
+                    logged_in_keywords = ['我的账户', '个人中心', '控制台', '仪表盘', '我的投注', '账户余额']
+                    if any(kw in body[:2000] for kw in logged_in_keywords):
+                        self.logger.info("检测到已登录状态关键词")
+                        return True
                     return True
                 elif response.status == 302:
                     self.logger.warning("cookie已失效，需要重新登录")

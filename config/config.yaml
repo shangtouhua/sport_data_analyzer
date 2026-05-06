@@ -21,6 +21,17 @@ spider:
     - "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:126.0) Gecko/20100101 Firefox/126.0"
     - "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:126.0) Gecko/20100101 Firefox/126.0"
 
+  # Playwright iframe爬取配置（平台A使用iframe加载第三方体育商数据，需浏览器渲染）
+  playwright_scraping:
+    # 默认使用的第三方体育提供商代码
+    provider: "YBTY"
+    # 是否无头模式（False可观察浏览器行为用于调试）
+    headless: true
+    # 导航后等待API响应捕获时间（毫秒）
+    capture_duration_ms: 15000
+    # Cookie文件路径（需先在浏览器登录后导出）
+    cookie_path: "data/platform_a_cookies.json"
+
   # 平台配置（示例配置，需要根据实际平台修改）
   platforms:
     platform_a:
@@ -33,6 +44,12 @@ spider:
       # 简单的API调用可能无法登录成功，推荐使用cookie登录方式
       login_api: "/site/api/v1/user/login"
       odds_endpoint: "/site/api/v1/odds"
+      # 登录状态验证端点（可选，推荐配置）
+      # 配置后优先通过该API验证cookie/token有效性（替代HTML页面扫描）
+      # 当该端点返回401/403/302时视为未登录，返回200时视为已登录
+      login_verify_endpoint: ""
+      # 验证请求中携带的认证header名称（默认X-API-TOKEN）
+      login_verify_header: "X-API-TOKEN"
       timeout: 30
       # 登录凭证（请替换为实际的登录信息）
       credentials:

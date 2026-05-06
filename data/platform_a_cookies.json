@@ -1,19 +1,25 @@
 [
     {
-        "name": "X-API-UUID",
-        "value": "561bcc64-d851-4c50-8eb2-0f155138adfc",
+        "name": "TRACK-HOUR",
+        "value": "11",
         "domain": "www.uompld.vip",
+        "path": "/user"
+    },
+    {
+        "name": "X-API-UUID",
+        "value": "ab650a09-560b-449a-aeed-8fec37227f9c",
+        "domain": "www.uompld.vip",
+        "path": "/"
+    },
+    {
+        "name": "captcha_v4_user",
+        "value": "f3c61bedc365407e84e1fd479c69f2d9",
+        "domain": "bcaptcha.botion.com",
         "path": "/"
     },
     {
         "name": "X-API-TOKEN",
-        "value": "d50b57d7515fcacad2ae53736302ffbac67feafcafc829f333afe9530e8ddbd2f407b0bbb77328a8b74c6f64916d201e",
-        "domain": "www.uompld.vip",
-        "path": "/"
-    },
-    {
-        "name": "PHPSESSID",
-        "value": "your_session_id_here",
+        "value": "d50b57d7515fcacad2ae53736302ffba6dafd6139b585d8aa9ece8bf6d23acf7ef185ec685e6e930cd4ab9c6ae5acc4a",
         "domain": "www.uompld.vip",
         "path": "/"
     }

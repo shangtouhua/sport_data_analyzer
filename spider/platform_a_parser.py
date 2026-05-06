@@ -1,6 +1,9 @@
 """
 平台A解析器
-继承BaseSpider，实现针对平台A的页面解析逻辑
+继承BaseSpider，使用Playwright网络拦截从iframe中提取第三方体育提供商赔率数据。
+
+平台A是一个Next.js SPA聚合平台，体育数据来自第三方提供商(YBTY/IMTY等)的iframe，
+直连API(/site/api/v1/odds)返回404，因此改用Playwright浏览器自动化 + 网络拦截方案。
 """
 
 from typing import Dict, List, Any, Optional
@@ -11,11 +14,12 @@ import os
 import json
 from datetime import datetime
 from .base_spider import BaseSpider
+from .iframe_network_interceptor import IframeDataExtractor
 
 class PlatformAParser(BaseSpider):
     """
     平台A解析器
-    针对平台A的页面结构和数据格式进行解析
+    使用Playwright拦截iframe API响应，通过Provider解析赔率数据
     """
 
     def __init__(self, config: Dict[str, Any], logger: logging.Logger):
@@ -30,7 +34,9 @@ class PlatformAParser(BaseSpider):
         self.platform_name = "platform_a"
 
         # 平台A特定配置
-        platform_config = config.get('spider', {}).get('platforms', {}).get('platform_a', {})
+        # 注意: config 是 spider 子配置（main.py传入spider_config），
+        # 因此 platform_a 在 config.platforms.platform_a 路径下
+        platform_config = config.get('platforms', {}).get('platform_a', {})
         self.base_url = platform_config.get('base_url', '')
         self.login_url = platform_config.get('login_url', '')
         self.login_api = platform_config.get('login_api', '')
@@ -42,9 +48,15 @@ class PlatformAParser(BaseSpider):
         # 验证码配置
         self.captcha_config = platform_config.get('captcha', {})
 
+        # Playwright爬取配置
+        pw_scraping = config.get('playwright_scraping', {})
+        self.pw_provider = pw_scraping.get('provider', 'YBTY')
+        self.pw_headless = pw_scraping.get('headless', True)
+        self.pw_capture_duration = pw_scraping.get('capture_duration_ms', 15000)
+        self.pw_cookie_path = pw_scraping.get('cookie_path', 'data/platform_a_cookies.json')
+
         # 完整的URL（优先使用login_api，回退到login_url）
         self.full_login_url = f"{self.base_url}{self.login_api}" if self.login_api else f"{self.base_url}{self.login_url}"
-        self.full_odds_url = f"{self.base_url}{self.odds_endpoint}"
 
     def extract_match_info(self, soup: BeautifulSoup) -> List[Dict[str, Any]]:
         """
@@ -232,7 +244,8 @@ class PlatformAParser(BaseSpider):
 
     async def crawl_matches(self, platform_config: Dict[str, Any]) -> List[Dict[str, Any]]:
         """
-        爬取赛事数据的主方法（包含登录检查）
+        爬取赛事数据的主方法
+        使用Playwright网络拦截从第三方体育提供商iframe提取赔率数据
 
         Args:
             platform_config: 平台配置
@@ -242,32 +255,31 @@ class PlatformAParser(BaseSpider):
         """
         self.logger.info(f"开始爬取平台数据: {platform_config['name']}")
 
-        # 确保已登录
+        # 确保已登录（验证cookie有效）
         if not await self._ensure_login():
             self.logger.error("登录失败，无法爬取数据")
             return []
 
-        # 构建完整的赔率页面URL
-        url = self.full_odds_url
+        self.logger.info(
+            f"使用Playwright拦截 [{self.pw_provider}] 数据, "
+            f"超时: {self.pw_capture_duration}ms"
+        )
 
-        self.logger.info(f"获取赔率页面: {url}")
+        # 使用IframeDataExtractor通过Playwright捕获数据
+        extractor = IframeDataExtractor(self.config, self.logger)
+        matches = await extractor.extract_from_page(
+            provider_code=self.pw_provider,
+            cookie_path=self.pw_cookie_path,
+            headless=self.pw_headless,
+            capture_duration=self.pw_capture_duration,
+        )
 
-        # 使用已登录的session获取页面
-        html_content = await self.fetch_page(url, timeout=platform_config.get('timeout', 30))
-        if not html_content:
-            self.logger.error(f"获取页面内容失败: {url}")
-            # 如果获取失败，可能是登录状态失效，重置登录状态
-            self.is_logged_in = False
-            return []
+        # 如果匹配数为0，可能是API结构变化或数据未加载完成
+        if not matches:
+            self.logger.warning("未提取到赛事数据（可能原因：cookie已过期、iframe未加载、API结构变化）")
 
-        try:
-            soup = self.parse_html(html_content)
-            matches = self.extract_match_info(soup)
-            self.logger.info(f"成功爬取 {len(matches)} 场比赛数据")
-            return matches
-        except Exception as e:
-            self.logger.error(f"解析页面失败: {str(e)}")
-            return []
+        self.logger.info(f"Playwright提取完成，共 {len(matches)} 场比赛")
+        return matches
 
     async def _ensure_login(self) -> bool:
         """
@@ -292,12 +304,9 @@ class PlatformAParser(BaseSpider):
             cookie_file = cookie_config.get('cookie_file', '')
             cookie_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), cookie_file)
             if os.path.exists(cookie_path):
-                # cookie文件存在但加载失败（占位符或过期），要求用户重新导出
-                self.logger.error("Cookie文件无效或包含占位符值，请重新在浏览器登录后导出")
-                self.logger.info("运行 python tools/extract_cookies.py 获取操作指南")
-                return False
-            # cookie文件不存在，尝试Playwright自动登录
-            self.logger.info("Cookie文件不存在，尝试其他登录方式")
+                self.logger.warning("Cookie文件无效或已过期，尝试使用Playwright自动登录...")
+            else:
+                self.logger.info("Cookie文件不存在，尝试其他登录方式")
 
         # 尝试Playwright自动登录
         playwright_available = False
