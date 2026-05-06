@@ -29,8 +29,18 @@ spider:
     headless: true
     # 导航后等待API响应捕获时间（毫秒）
     capture_duration_ms: 15000
+    # 主站 hotLive/list 数据源（一次获取全部比赛的独赢赔率，比分iframe逐个请求高效）
+    hotlive_enabled: true
+    hotlive_path: "/site/api/v1/video/hotLive/list"
     # Cookie文件路径（需先在浏览器登录后导出）
     cookie_path: "data/platform_a_cookies.json"
+    # 数据过滤器
+    filters:
+      # 运动类型过滤: 只抓取指定运动类型的赛事，null表示不过滤
+      sport_type: "足球"
+      # 市场类型过滤: 只提取指定市场类型的赔率，空列表表示全部
+      # 可选值: 独赢(hpt=1), 让球(hpt=2), 大小(hpt=5)
+      market_types: ["独赢"]
 
   # 平台配置（示例配置，需要根据实际平台修改）
   platforms:
