@@ -1,7 +1,13 @@
 [
     {
-        "name": "token",
-        "value": "your_token_value_here",
+        "name": "X-API-UUID",
+        "value": "561bcc64-d851-4c50-8eb2-0f155138adfc",
+        "domain": "www.uompld.vip",
+        "path": "/"
+    },
+    {
+        "name": "X-API-TOKEN",
+        "value": "d50b57d7515fcacad2ae53736302ffbac67feafcafc829f333afe9530e8ddbd2f407b0bbb77328a8b74c6f64916d201e",
         "domain": "www.uompld.vip",
         "path": "/"
     },

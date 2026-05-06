@@ -7,6 +7,8 @@ from typing import Dict, List, Any, Optional
 from bs4 import BeautifulSoup
 import logging
 import re
+import os
+import json
 from datetime import datetime
 from .base_spider import BaseSpider
 
@@ -270,6 +272,7 @@ class PlatformAParser(BaseSpider):
     async def _ensure_login(self) -> bool:
         """
         确保登录状态
+        优先使用cookie登录，cookie无效时才尝试Playwright或API登录
 
         Returns:
             是否成功登录
@@ -278,21 +281,48 @@ class PlatformAParser(BaseSpider):
         if self.is_logged_in:
             return await self.ensure_login(
                 login_url=self.full_login_url,
-                credentials=self.credentials if self.credentials.get('username') else {},
+                credentials={},  # cookie模式下不传密码，避免fallback到API登录
+                captcha_config=self.captcha_config,
+                max_retries=1
+            )
+
+        # 检查cookie_login配置：如果启用了cookie但未登录，说明cookie文件无效或被拒绝
+        cookie_config = self.config.get('spider', {}).get('platforms', {}).get('platform_a', {}).get('cookie_login', {})
+        if cookie_config.get('enabled', False):
+            cookie_file = cookie_config.get('cookie_file', '')
+            cookie_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), cookie_file)
+            if os.path.exists(cookie_path):
+                # cookie文件存在但加载失败（占位符或过期），要求用户重新导出
+                self.logger.error("Cookie文件无效或包含占位符值，请重新在浏览器登录后导出")
+                self.logger.info("运行 python tools/extract_cookies.py 获取操作指南")
+                return False
+            # cookie文件不存在，尝试Playwright自动登录
+            self.logger.info("Cookie文件不存在，尝试其他登录方式")
+
+        # 尝试Playwright自动登录
+        playwright_available = False
+        try:
+            import playwright
+            playwright_available = True
+        except ImportError:
+            pass
+
+        if playwright_available and self.credentials.get('username'):
+            self.logger.info("Cookie登录不可用，尝试Playwright自动登录...")
+            success = await self._login_with_playwright(self.credentials)
+            if success:
+                return True
+
+        # 最后尝试API登录（需要平台支持，大概率因AES加密失败）
+        if self.credentials.get('username') and self.credentials.get('password'):
+            self.logger.warning("API直接登录成功率低（平台使用AES加密密码），建议使用cookie方式")
+            return await self.ensure_login(
+                login_url=self.full_login_url,
+                credentials=self.credentials,
                 captcha_config=self.captcha_config,
                 max_retries=self.captcha_config.get('retry_limit', 3)
             )
 
-        # 需要登录凭证进行API登录
-        if not self.credentials.get('username') or not self.credentials.get('password'):
-            self.logger.error("缺少登录凭证，无法登录")
-            self.logger.info("请在浏览器登录后导出cookie到 data/platform_a_cookies.json")
-            return False
-
-        # 确保登录状态
-        return await self.ensure_login(
-            login_url=self.full_login_url,
-            credentials=self.credentials,
-            captcha_config=self.captcha_config,
-            max_retries=self.captcha_config.get('retry_limit', 3)
-        )
+        self.logger.error("所有登录方式均不可用")
+        self.logger.info("请在浏览器登录后导出cookie到 data/platform_a_cookies.json")
+        return False

@@ -7,9 +7,12 @@ fuzzywuzzy==0.18.0
 python-levenshtein==0.21.0
 
 # 验证码识别相关依赖
-pytesseract==0.3.10  # OCR文字识别
+pytesseract==0.3.10  # OCR文字识别（备用）
 Pillow==10.1.0       # 图片处理
 opencv-python==4.8.1.78  # 图像处理（可选）
+numpy==1.26.2        # 数值计算
+ddddocr==1.4.11      # 验证码OCR专用（轻量级，中文验证码识别）
+ultralytics==8.0.196  # YOLOv8目标检测（可选，用于canvas中的字符检测）
 
 # 开发工具（可选）
 black==23.11.0  # 代码格式化

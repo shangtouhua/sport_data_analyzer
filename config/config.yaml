@@ -15,9 +15,11 @@ spider:
 
   # 请求头配置
   user_agents:
-    - "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
-    - "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
-    - "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
+    - "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"
+    - "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"
+    - "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"
+    - "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:126.0) Gecko/20100101 Firefox/126.0"
+    - "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:126.0) Gecko/20100101 Firefox/126.0"
 
   # 平台配置（示例配置，需要根据实际平台修改）
   platforms:
@@ -36,11 +38,23 @@ spider:
       credentials:
         username: "hua1212a1"
         password: "baihua920728"
-      # 验证码配置（该平台使用GeeTest验证码，在需要时动态加载）
+      # 验证码配置
       captcha:
-        enabled: false  # 无需传统图片验证码
+        enabled: false  # 无需传统图片验证码（通过API请求跳过）
         type: "none"
         retry_limit: 3
+      # 点击式验证码配置（OCR + YOLO 识别文字并按顺序点击）
+      # 某些平台在登录时会出现"请按顺序点击以下文字"类型的验证码
+      click_captcha:
+        enabled: true                   # 是否启用点击验证码自动求解
+        ocr_engine: "ddddocr"           # OCR引擎: ddddocr / pytesseract
+        use_yolo: false                 # 是否使用YOLO检测元素（HTML元素默认用Playwright选择器）
+        yolo_model: "yolov8n.pt"        # YOLO模型名称（仅在use_yolo=true时使用）
+        max_retries: 3                  # 最大重试次数
+        click_delay_min: 0.3            # 点击间最小延时（秒）
+        click_delay_max: 0.8            # 点击间最大延时（秒）
+        detect_timeout: 5               # 检测验证码出现的超时时间（秒）
+        manual_timeout: 90              # 手动完成超时时间（秒）
       # Cookie登录配置（推荐方式）
       # 使用方式：在浏览器登录后，通过开发者工具将cookie复制到cookie_file中
       cookie_login:

@@ -16,6 +16,9 @@ import io
 import base64
 import json
 import os
+import tempfile
+
+from .captcha_solver import ClickCaptchaSolver
 
 class BaseSpider:
     """
@@ -48,7 +51,7 @@ class BaseSpider:
 
     async def __aenter__(self):
         """异步上下文管理器入口"""
-        self.session = aiohttp.ClientSession()
+        self.session = aiohttp.ClientSession(trust_env=False)
 
         # 尝试从文件加载cookie（如果配置了cookie登录）
         cookie_loaded = await self._try_load_cookies_from_file()
@@ -69,10 +72,11 @@ class BaseSpider:
 
     async def _try_load_cookies_from_file(self) -> bool:
         """
-        尝试从配置文件指定的路径加载cookie
+        尝试从配置文件指定的路径加载并验证cookie
+        包含对占位符值、合并cookie的检测，以及加载后主动验证
 
         Returns:
-            cookie是否加载成功
+            cookie是否有效且已加载
         """
         try:
             platform_config = self.config.get('spider', {}).get('platforms', {}).get('platform_a', {})
@@ -93,25 +97,106 @@ class BaseSpider:
             with open(cookie_path, 'r', encoding='utf-8') as f:
                 cookies_data = json.load(f)
 
+            # 检测无效cookie（占位符值）
+            placeholder_patterns = ['your_', 'replace_', 'placeholder', 'xxx', 'here']
+            invalid_cookies = []
+            for c in cookies_data:
+                if isinstance(c, dict):
+                    val = c.get('value', '')
+                    if any(p in val.lower() for p in placeholder_patterns):
+                        invalid_cookies.append(c.get('name', 'unknown'))
+
+            if invalid_cookies:
+                self.logger.error(f"Cookie文件包含无效的占位符值: {invalid_cookies}")
+                self.logger.error("请在浏览器登录后，重新导出真实的cookie到 data/platform_a_cookies.json")
+                self.logger.error("运行以下命令获取帮助: python tools/extract_cookies.py")
+                return False
+
+            # 检测合并cookie（一个cookie值包含多个键值对）
+            for c in cookies_data:
+                if isinstance(c, dict) and '; ' in c.get('value', ''):
+                    self.logger.warning(
+                        f"Cookie '{c.get('name')}' 包含合并的cookie值（含有'; '分隔符），"
+                        f"应拆分为独立cookie条目"
+                    )
+
             # 将cookie注入到session中
             base_url = platform_config.get('base_url', '')
+            loaded_count = 0
             for cookie in cookies_data:
                 if isinstance(cookie, dict):
                     name = cookie.get('name', '')
                     value = cookie.get('value', '')
-                    domain = cookie.get('domain', 'www.uompld.vip')
                     if name and value:
                         self.session.cookie_jar.update_cookies(
                             {name: value},
                             response_url=base_url
                         )
+                        loaded_count += 1
+
+            # 从cookie中提取login_token（X-API-TOKEN）
+            for cookie in cookies_data:
+                if isinstance(cookie, dict) and cookie.get('name') == 'X-API-TOKEN':
+                    self.login_token = cookie.get('value', '')
+                    break
 
             self.login_cookies = self.session.cookie_jar
-            self.logger.info(f"已从文件加载 {len(cookies_data)} 个cookie")
+            self.logger.info(f"已从文件加载 {loaded_count} 个cookie")
+
+            # 主动验证cookie是否有效
+            if not await self._verify_cookies_work():
+                self.logger.error("Cookie已过期或无效，需要重新在浏览器登录并导出")
+                self.logger.info("运行以下命令获取帮助: python tools/extract_cookies.py")
+                self.is_logged_in = False
+                return False
+
+            self.logger.info("Cookie验证通过，登录状态有效")
             return True
 
         except Exception as e:
             self.logger.warning(f"加载cookie文件失败: {str(e)}")
+            return False
+
+    async def _verify_cookies_work(self) -> bool:
+        """
+        主动验证当前session中的cookie是否有效
+        通过访问首页并检测响应状态和内容来判断
+
+        Returns:
+            cookie是否有效
+        """
+        try:
+            platform_config = self.config.get('spider', {}).get('platforms', {}).get('platform_a', {})
+            base_url = platform_config.get('base_url', '')
+            if not base_url:
+                return False
+
+            headers = self.get_random_headers()
+            headers['Accept'] = 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8'
+
+            async with self.session.get(
+                base_url, headers=headers, allow_redirects=False, timeout=15
+            ) as response:
+                if response.status in (302, 301, 307):
+                    self.logger.warning(f"Cookie无效：请求被重定向到 {response.headers.get('Location', 'unknown')}")
+                    return False
+                if response.status in (401, 403):
+                    self.logger.warning(f"Cookie无效：返回状态码 {response.status}")
+                    return False
+                if response.status != 200:
+                    return False
+
+                body = await response.text()
+                login_indicators = ['登录', 'login', 'signin', '登录', '用户登录']
+                for indicator in login_indicators:
+                    if indicator in body[:2000]:
+                        self.logger.warning("Cookie无效：返回页面包含登录表单")
+                        return False
+
+                return True
+
+        except Exception as e:
+            self.logger.warning(f"验证cookie时发生异常: {str(e)}")
             return False
 
     def get_random_headers(self) -> Dict[str, str]:
@@ -660,6 +745,516 @@ class BaseSpider:
         # 如果没有明确的失败提示，默认成功
         return True
 
+    async def _login_with_playwright(self, credentials: Dict[str, str]) -> bool:
+        """
+        使用Playwright自动化浏览器登录
+        通过真实浏览器处理AES加密、浏览器指纹等反爬机制
+
+        Args:
+            credentials: 登录凭证
+
+        Returns:
+            登录是否成功
+        """
+        try:
+            from playwright.async_api import async_playwright
+
+            platform_config = self.config.get('spider', {}).get('platforms', {}).get('platform_a', {})
+            base_url = platform_config.get('base_url', '')
+            login_url = f"{base_url}/user/login"
+
+            self.logger.info(f"使用Playwright自动登录: {login_url}")
+            self.logger.info("正在启动浏览器...")
+
+            async with async_playwright() as pw:
+                browser = await pw.chromium.launch(
+                    channel='chrome',
+                    headless=False,
+                    args=[
+                        '--no-sandbox',
+                        '--disable-blink-features=AutomationControlled',
+                        '--disable-web-security',
+                    ]
+                )
+                context = await browser.new_context(
+                    user_agent=random.choice(self.user_agents) if self.user_agents else None,
+                    viewport={'width': 1920, 'height': 1080},
+                    locale='zh-CN'
+                )
+
+                await context.add_init_script("""
+                    Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+                    Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
+                """)
+
+                page = await context.new_page()
+                page.set_default_timeout(60000)
+
+                # 导航到登录页面
+                self.logger.info("正在打开登录页面...")
+                await page.goto(login_url, wait_until='networkidle', timeout=60000)
+                await page.wait_for_timeout(2000)
+
+                # 尝试自动填写登录表单
+                auto_filled = False
+                selectors = [
+                    'input[placeholder*="账号" i], input[placeholder*="用户" i], input[name="username"], input[name="account"]',
+                    'input[type="text"]',
+                ]
+                for sel in selectors:
+                    try:
+                        inp = await page.wait_for_selector(sel, timeout=5000)
+                        if inp:
+                            await inp.fill(credentials.get('username', ''))
+                            self.logger.info(f"已自动填写用户名 (使用选择器: {sel})")
+                            auto_filled = True
+                            break
+                    except Exception:
+                        continue
+
+                password_selectors = [
+                    'input[placeholder*="密码" i], input[name="password"]',
+                    'input[type="password"]',
+                ]
+                pw_filled = False
+                for sel in password_selectors:
+                    try:
+                        inp = await page.wait_for_selector(sel, timeout=5000)
+                        if inp:
+                            await inp.fill(credentials.get('password', ''))
+                            self.logger.info(f"已自动填写密码 (使用选择器: {sel})")
+                            pw_filled = True
+                            break
+                    except Exception:
+                        continue
+
+                if auto_filled and pw_filled:
+                    await page.wait_for_timeout(500)
+                    # 尝试点击登录按钮
+                    btn_selectors = [
+                        'button[type="submit"]',
+                        'button:has-text("登录")',
+                        'button:has-text("登入")',
+                        'button:has-text("login")',
+                        '.login-btn',
+                        '.submit-btn',
+                    ]
+                    clicked = False
+                    for sel in btn_selectors:
+                        btn = await page.query_selector(sel)
+                        if btn:
+                            await btn.click()
+                            self.logger.info("已点击登录按钮")
+                            clicked = True
+                            break
+                    if not clicked:
+                        self.logger.warning("未找到登录按钮，尝试Enter提交")
+                        await page.keyboard.press('Enter')
+
+                    # 检测并处理 GeeTest 行为验证码（滑块拼图）
+                    self.logger.info("检测GeeTest验证码...")
+                    captcha_passed = await self._detect_and_solve_geetest(page)
+
+                    if not captcha_passed:
+                        self.logger.warning("GeeTest验证码处理未完成，但仍尝试等待登录")
+
+                    # 检测并处理点击式文字验证码（OCR + 顺序点击）
+                    self.logger.info("检测点击式验证码...")
+                    click_captcha_passed = await self._detect_and_solve_click_captcha(page)
+
+                    if not click_captcha_passed:
+                        self.logger.warning("点击式验证码处理未完成，但仍尝试等待登录")
+
+                    # 部分平台的验证码通过后仍需再次点击登录按钮
+                    try:
+                        still_on_login = '/user/login' in page.url
+                        if still_on_login:
+                            self.logger.info("验证码已通过，再次点击登录按钮...")
+                            for sel in btn_selectors:
+                                btn = await page.query_selector(sel)
+                                if btn and await btn.is_enabled():
+                                    await btn.click()
+                                    self.logger.info("已重新点击登录按钮")
+                                    break
+                    except Exception:
+                        pass
+
+                    self.logger.info("等待登录完成（15秒）...")
+                    try:
+                        await page.wait_for_url(
+                            lambda url: '/user/login' not in url,
+                            timeout=15000
+                        )
+                    except Exception:
+                        pass
+                else:
+                    self.logger.warning("自动填写未完全成功，请手动在浏览器中完成登录")
+                    self.logger.info("请在浏览器窗口中手动输入账号密码并登录")
+                    self.logger.info("等待手动登录（最多90秒）...")
+                    try:
+                        await page.wait_for_url(
+                            lambda url: '/user/login' not in url,
+                            timeout=90000
+                        )
+                    except Exception:
+                        pass
+
+                await page.wait_for_timeout(2000)
+
+                # 检查登录是否成功
+                current_url = page.url
+                if '/user/login' in current_url:
+                    self.logger.error("Playwright登录失败：仍然停留在登录页面")
+                    try:
+                        error_text = await page.text_content(
+                            '.error-message, .el-message, [class*="error"], .message, .tip'
+                        )
+                        if error_text and error_text.strip():
+                            self.logger.error(f"页面错误提示: {error_text.strip()}")
+                    except Exception:
+                        pass
+                    await browser.close()
+                    return False
+
+                self.logger.info(f"Playwright登录成功，当前URL: {current_url}")
+
+                # 从浏览器上下文获取cookies
+                browser_cookies = await context.cookies()
+                self.logger.info(f"从浏览器获取到 {len(browser_cookies)} 个cookie")
+
+                # 将cookie注入到aiohttp session
+                for cookie in browser_cookies:
+                    self.session.cookie_jar.update_cookies(
+                        {cookie['name']: cookie['value']},
+                        response_url=base_url
+                    )
+                    if cookie['name'] == 'X-API-TOKEN':
+                        self.login_token = cookie['value']
+
+                self.login_cookies = self.session.cookie_jar
+                self.is_logged_in = True
+
+                # 保存cookie到文件以备后续使用
+                self._save_cookies_to_file(browser_cookies)
+
+                await browser.close()
+                self.logger.info("Playwright登录流程完成，cookie已保存")
+                return True
+
+        except ImportError as e:
+            self.logger.error(f"Playwright未安装: {str(e)}")
+            self.logger.info("请运行: pip install playwright && playwright install")
+            return False
+        except Exception as e:
+            self.logger.error(f"Playwright登录失败: {str(e)}")
+            self.logger.info("提示: Playwright登录需要系统安装Chrome浏览器")
+            return False
+
+    def _save_cookies_to_file(self, cookies: list) -> None:
+        """
+        将cookie列表保存到配置文件指定的路径
+
+        Args:
+            cookies: cookie对象列表（包含name, value, domain, path字段）
+        """
+        try:
+            platform_config = self.config.get('spider', {}).get('platforms', {}).get('platform_a', {})
+            cookie_config = platform_config.get('cookie_login', {})
+            cookie_file = cookie_config.get('cookie_file', '')
+            if not cookie_file:
+                return
+
+            cookie_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), cookie_file)
+
+            cookies_data = []
+            for c in cookies:
+                cookies_data.append({
+                    'name': c.get('name', ''),
+                    'value': c.get('value', ''),
+                    'domain': c.get('domain', 'www.uompld.vip'),
+                    'path': c.get('path', '/'),
+                })
+
+            with open(cookie_path, 'w', encoding='utf-8') as f:
+                json.dump(cookies_data, f, ensure_ascii=False, indent=4)
+
+            self.logger.info(f"已将 {len(cookies_data)} 个cookie保存到 {cookie_path}")
+        except Exception as e:
+            self.logger.warning(f"保存cookie到文件失败: {str(e)}")
+
+    # ==================== GeeTest 行为验证码处理 ====================
+
+    async def _detect_and_solve_geetest(self, page, detect_timeout: int = 5) -> bool:
+        """
+        检测并处理 GeeTest 行为验证码（滑块拼图）
+
+        流程：
+        1. 等待 GeeTest 弹窗出现（短超时，无验证码则跳过）
+        2. 尝试自动滑块求解（类人鼠标拖动，最多3次）
+        3. 自动求解失败时，提示用户手动完成
+        4. 等待验证码通过后继续执行
+
+        Args:
+            page: Playwright 页面对象
+            detect_timeout: 检测验证码出现的超时时间（秒）
+
+        Returns:
+            bool: 验证码是否已通过（True=已通过或无需处理，False=超时未通过）
+        """
+        try:
+            # 等待 GeeTest 容器出现（多个常见选择器）
+            geetest_selectors = [
+                '.geetest_panel',
+                '.geetest',
+                '#geetest-captcha',
+                '.gt_slider',
+                '.geetest-holder',
+            ]
+
+            geetest_appeared = False
+            for selector in geetest_selectors:
+                try:
+                    await page.wait_for_selector(selector, timeout=detect_timeout * 1000)
+                    geetest_appeared = True
+                    self.logger.info(f"检测到 GeeTest 验证码（选择器: {selector}）")
+                    break
+                except Exception:
+                    continue
+
+            if not geetest_appeared:
+                self.logger.debug("未检测到 GeeTest 验证码，继续执行")
+                return True
+
+            # 等待动画和 iframe 加载完成
+            await asyncio.sleep(1.5)
+
+            # 尝试自动求解（最多3次）
+            for attempt in range(3):
+                self.logger.info(f"自动滑块求解 第 {attempt + 1} 次尝试...")
+                solved = await self._auto_slide_geetest(page)
+
+                if solved:
+                    self.logger.info("GeeTest 验证码自动求解成功！")
+                    await asyncio.sleep(1)
+                    return True
+
+                self.logger.warning(f"第 {attempt + 1} 次自动求解失败")
+                await asyncio.sleep(1)
+
+            # 自动求解失败，回退到手动验证
+            self.logger.warning("=" * 50)
+            self.logger.warning("自动滑块求解失败，请手动完成验证码拼图")
+            self.logger.warning("请在浏览器窗口中手动拖动滑块完成验证")
+            self.logger.warning("完成验证码后，系统将自动继续")
+            self.logger.warning("等待时间：最多 90 秒")
+            self.logger.warning("=" * 50)
+
+            manual_result = await self._wait_for_geetest_completion(page, timeout=90)
+
+            if manual_result:
+                self.logger.info("手动验证码已完成，继续登录流程")
+                await asyncio.sleep(0.5)
+                return True
+            else:
+                self.logger.error("验证码超时（90秒未完成），登录流程可能未完成")
+                return False
+
+        except Exception as e:
+            self.logger.warning(f"GeeTest 验证码处理异常: {e}")
+            return True
+
+    async def _auto_slide_geetest(self, page) -> bool:
+        """
+        自动滑动 GeeTest 滑块验证码
+
+        通过 Playwright 模拟类人鼠标拖动，支持 iframe 内嵌和直接 DOM 两种场景。
+
+        Args:
+            page: Playwright 页面对象
+
+        Returns:
+            bool: 滑动是否通过验证
+        """
+        try:
+            # 检测 GeeTest 是否在 iframe 中
+            geetest_frame = page
+            frame_selectors = [
+                '.geetest_panel iframe',
+                '.geetest-captcha iframe',
+                'iframe[src*="geetest"]',
+                'iframe[id*="geetest"]',
+            ]
+            for fs in frame_selectors:
+                iframe_elem = await page.query_selector(fs)
+                if iframe_elem:
+                    try:
+                        frame = await iframe_elem.content_frame()
+                        if frame:
+                            geetest_frame = frame
+                            self.logger.debug("GeeTest 位于 iframe 内")
+                            break
+                    except Exception:
+                        continue
+
+            # 定位滑块按钮
+            slider_btn = None
+            slider_selectors = [
+                '.geetest_slider_button',
+                '.gt_slider_knob',
+                '.slider-btn',
+                '.geetest_slider > div',
+                '.geetest_btn',
+            ]
+            for selector in slider_selectors:
+                try:
+                    slider_btn = await geetest_frame.wait_for_selector(selector, timeout=2000)
+                    if slider_btn and await slider_btn.is_visible():
+                        self.logger.debug(f"定位到滑块按钮 (选择器: {selector})")
+                        break
+                except Exception:
+                    continue
+
+            if not slider_btn:
+                self.logger.warning("未定位到 GeeTest 滑块按钮")
+                return False
+
+            box = await slider_btn.bounding_box()
+            if not box:
+                self.logger.warning("无法获取滑块位置信息")
+                return False
+
+            start_x = box['x'] + box['width'] / 2
+            start_y = box['y'] + box['height'] / 2
+
+            # 计算目标拖动距离
+            track = await page.query_selector('.geetest_slider, .gt_slider, .geetest_track')
+            if track:
+                track_box = await track.bounding_box()
+                if track_box:
+                    target_x = track_box['x'] + track_box['width'] - box['width'] / 2 - 5
+                else:
+                    target_x = start_x + 250
+            else:
+                target_x = start_x + 250
+
+            target_y = start_y + random.uniform(-2, 2)
+
+            # 执行类人拖动
+            await page.mouse.move(start_x, start_y)
+            await page.mouse.down()
+            await asyncio.sleep(random.uniform(0.05, 0.1))
+
+            steps = random.randint(28, 42)
+            for i in range(1, steps + 1):
+                progress = i / steps
+                eased_progress = progress ** 1.15
+                current_x = start_x + (target_x - start_x) * eased_progress
+                y_jitter = random.uniform(-3, 3) * max(0, 1 - progress * 0.8)
+                current_y = target_y + y_jitter
+
+                await page.mouse.move(current_x, current_y)
+                await asyncio.sleep(random.uniform(0.008, 0.025))
+
+            await asyncio.sleep(random.uniform(0.03, 0.06))
+            await page.mouse.up()
+
+            await asyncio.sleep(2)
+
+            # 检查验证结果
+            solved = await page.evaluate("""
+                () => {
+                    const panel = document.querySelector('.geetest_panel');
+                    if (!panel) return true;
+
+                    const style = window.getComputedStyle(panel);
+                    if (style.display === 'none' || style.visibility === 'hidden') return true;
+
+                    if (panel.classList.contains('geetest_success')) return true;
+
+                    return false;
+                }
+            """)
+
+            return solved
+
+        except Exception as e:
+            self.logger.warning(f"自动滑块求解异常: {e}")
+            return False
+
+    async def _wait_for_geetest_completion(self, page, timeout: int = 90) -> bool:
+        """
+        等待用户手动完成 GeeTest 验证码
+
+        轮询检测 GeeTest 面板状态，直到验证通过或超时。
+
+        Args:
+            page: Playwright 页面对象
+            timeout: 超时时间（秒）
+
+        Returns:
+            bool: 是否已完成验证
+        """
+        try:
+            start_wait = time.time()
+            while time.time() - start_wait < timeout:
+                solved = await page.evaluate("""
+                    () => {
+                        const panel = document.querySelector('.geetest_panel');
+                        if (!panel) return true;
+
+                        const style = window.getComputedStyle(panel);
+                        if (style.display === 'none' || style.visibility === 'hidden') return true;
+
+                        if (panel.classList.contains('geetest_success')) return true;
+
+                        return false;
+                    }
+                """)
+
+                if solved:
+                    return True
+
+                await asyncio.sleep(1)
+
+            return False
+
+        except Exception as e:
+            self.logger.warning(f"等待手动验证码时异常: {e}")
+            return False
+
+    # ==================== 点击式验证码处理 ====================
+
+    async def _detect_and_solve_click_captcha(self, page) -> bool:
+        """
+        检测并处理"按顺序点击文字"类型的验证码
+        使用OCR识别文字 + 按顺序自动点击
+
+        流程：
+        1. 加载点击验证码配置
+        2. 创建ClickCaptchaSolver实例
+        3. 调用detect_and_solve自动检测和求解
+
+        Args:
+            page: Playwright 页面对象
+
+        Returns:
+            bool: 验证码是否已通过
+        """
+        try:
+            platform_config = self.config.get('spider', {}).get('platforms', {}).get('platform_a', {})
+            click_captcha_config = platform_config.get('click_captcha', {})
+
+            if not click_captcha_config.get('enabled', False):
+                self.logger.debug("点击式验证码求解未启用")
+                return True
+
+            solver = ClickCaptchaSolver(click_captcha_config, logger=self.logger)
+            return await solver.detect_and_solve(page)
+
+        except Exception as e:
+            self.logger.warning(f"点击式验证码处理异常: {e}")
+            return True
+
     async def check_login_status(self, check_url: Optional[str] = None) -> bool:
         """
         检查登录状态是否有效
@@ -674,23 +1269,40 @@ class BaseSpider:
             if not self.is_logged_in:
                 return False
 
-            # 如果有login_token，尝试通过API验证
+            # 如果有login_token，验证其有效性
             if self.login_token:
                 self.logger.info("使用token验证登录状态")
-                return True  # token存在说明已登录
+                platform_config = self.config.get('spider', {}).get('platforms', {}).get('platform_a', {})
+                base_url = platform_config.get('base_url', '')
+                headers = self.get_random_headers()
+                headers['X-API-TOKEN'] = self.login_token
+                try:
+                    async with self.session.get(
+                        base_url, headers=headers, allow_redirects=False, timeout=15
+                    ) as response:
+                        if response.status in (302, 301, 401, 403):
+                            self.logger.warning("Token已失效")
+                            return False
+                        if response.status == 200:
+                            return True
+                except Exception:
+                    pass
 
-            # 如果没有提供检查URL，使用一个需要登录的页面
+            # 如果没有提供检查URL，使用base_url
             if not check_url:
                 platform_cfg = self.config.get('spider', {}).get('platforms', {}).get('platform_a', {})
                 check_url = platform_cfg.get('base_url', '')
 
-            # 发送请求检查登录状态
             headers = self.get_random_headers()
 
             async with self.session.get(check_url, headers=headers, allow_redirects=False) as response:
-                # 如果登录成功，访问受保护页面不会重定向到登录页
-                # 如果返回302重定向（到登录页），说明cookie已失效
                 if response.status in (200, 304):
+                    body = await response.text()
+                    login_indicators = ['登录', 'login', 'signin', '用户登录']
+                    for indicator in login_indicators:
+                        if indicator in body[:2000]:
+                            self.logger.warning("登录状态无效：返回页面包含登录表单")
+                            return False
                     return True
                 elif response.status == 302:
                     self.logger.warning("cookie已失效，需要重新登录")
@@ -725,6 +1337,12 @@ class BaseSpider:
             else:
                 self.logger.info("登录状态已失效，需要重新登录")
                 self.is_logged_in = False
+
+        # 没有提供登录凭证，直接返回失败
+        if not credentials.get('username') or not credentials.get('password'):
+            self.logger.error("未提供有效的登录凭证，跳过API登录")
+            self.logger.info("请在浏览器登录后导出cookie，或配置有效的用户名和密码")
+            return False
 
         # 执行登录
         for attempt in range(max_retries):
