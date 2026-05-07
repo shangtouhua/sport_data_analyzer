@@ -119,7 +119,7 @@ class PlatformAParser(BaseSpider):
             )
 
         # 检查cookie_login配置：如果启用了cookie但未登录，说明cookie文件无效或被拒绝
-        cookie_config = self.config.get('spider', {}).get('platforms', {}).get('platform_a', {}).get('cookie_login', {})
+        cookie_config = self.config.get('platforms', {}).get('platform_a', {}).get('cookie_login', {})
         if cookie_config.get('enabled', False):
             cookie_file = cookie_config.get('cookie_file', '')
             cookie_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), cookie_file)

@@ -38,13 +38,12 @@ class BaseSpider:
         self.config = config
         self.logger = logger
         self.session = None
-        # 从config.yaml的spider层级读取配置
-        spider_cfg = config.get('spider', {})
-        self.user_agents = spider_cfg.get('user_agents', [])
-        self.min_delay = spider_cfg.get('min_delay', 0.5)
-        self.max_delay = spider_cfg.get('max_delay', 3.0)
-        self.max_retries = spider_cfg.get('max_retries', 3)
-        self.retry_delay = spider_cfg.get('retry_delay', 1.0)
+        # 从config读取爬虫配置（config已是spider子段）
+        self.user_agents = config.get('user_agents', [])
+        self.min_delay = config.get('min_delay', 0.5)
+        self.max_delay = config.get('max_delay', 3.0)
+        self.max_retries = config.get('max_retries', 3)
+        self.retry_delay = config.get('retry_delay', 1.0)
         # 登录状态管理
         self.is_logged_in = False
         self.login_cookies = None
@@ -80,7 +79,7 @@ class BaseSpider:
             cookie是否有效且已加载
         """
         try:
-            platform_config = self.config.get('spider', {}).get('platforms', {}).get('platform_a', {})
+            platform_config = self.config.get('platforms', {}).get('platform_a', {})
             cookie_config = platform_config.get('cookie_login', {})
             if not cookie_config.get('enabled', False):
                 return False
@@ -173,7 +172,7 @@ class BaseSpider:
             cookie是否有效
         """
         try:
-            platform_config = self.config.get('spider', {}).get('platforms', {}).get('platform_a', {})
+            platform_config = self.config.get('platforms', {}).get('platform_a', {})
             base_url = platform_config.get('base_url', '')
             if not base_url:
                 return False
@@ -401,7 +400,7 @@ class BaseSpider:
             self.logger.info(f"开始登录: {login_url}")
 
             # 判断登录方式：如果配置了login_api字段，使用JSON API方式登录
-            platform_config = self.config.get('spider', {}).get('platforms', {}).get('platform_a', {})
+            platform_config = self.config.get('platforms', {}).get('platform_a', {})
             login_api = platform_config.get('login_api', '')
 
             if login_api:
@@ -444,11 +443,13 @@ class BaseSpider:
             }
 
             headers = self.get_random_headers()
-            base_url = self.config.get('spider', {}).get('platforms', {}).get('platform_a', {}).get('base_url', '')
+            platform_cfg = self.config.get('platforms', {}).get('platform_a', {})
+            base_url = platform_cfg.get('base_url', '')
+            login_page = platform_cfg.get('login_url', '/user/login')
             headers.update({
                 'Content-Type': 'application/json',
                 'Accept': 'application/json, text/plain, */*',
-                'Referer': f'{base_url}/user/login'
+                'Referer': f'{base_url}{login_page}'
             })
 
             async with self.session.post(login_api_url, json=login_data, headers=headers) as response:
@@ -804,9 +805,10 @@ class BaseSpider:
         try:
             from playwright.async_api import async_playwright
 
-            platform_config = self.config.get('spider', {}).get('platforms', {}).get('platform_a', {})
+            platform_config = self.config.get('platforms', {}).get('platform_a', {})
             base_url = platform_config.get('base_url', '')
-            login_url = f"{base_url}/user/login"
+            login_page = platform_config.get('login_url', '/user/login')
+            login_url = f"{base_url}{login_page}"
 
             self.logger.info(f"使用Playwright自动登录: {login_url}")
             self.logger.info("正在启动浏览器...")
@@ -1036,7 +1038,7 @@ class BaseSpider:
             cookies: cookie对象列表（包含name, value, domain, path字段）
         """
         try:
-            platform_config = self.config.get('spider', {}).get('platforms', {}).get('platform_a', {})
+            platform_config = self.config.get('platforms', {}).get('platform_a', {})
             cookie_config = platform_config.get('cookie_login', {})
             cookie_file = cookie_config.get('cookie_file', '')
             if not cookie_file:
@@ -1327,7 +1329,7 @@ class BaseSpider:
             bool: 验证码是否已通过
         """
         try:
-            platform_config = self.config.get('spider', {}).get('platforms', {}).get('platform_a', {})
+            platform_config = self.config.get('platforms', {}).get('platform_a', {})
             click_captcha_config = platform_config.get('click_captcha', {})
 
             if not click_captcha_config.get('enabled', False):
@@ -1355,7 +1357,7 @@ class BaseSpider:
             if not self.is_logged_in:
                 return False
 
-            platform_config = self.config.get('spider', {}).get('platforms', {}).get('platform_a', {})
+            platform_config = self.config.get('platforms', {}).get('platform_a', {})
             base_url = platform_config.get('base_url', '')
             verify_endpoint = platform_config.get('login_verify_endpoint', '')
             verify_header_name = platform_config.get('login_verify_header', 'X-API-TOKEN')
@@ -1399,7 +1401,7 @@ class BaseSpider:
 
             # 如果没有提供检查URL，使用base_url
             if not check_url:
-                platform_cfg = self.config.get('spider', {}).get('platforms', {}).get('platform_a', {})
+                platform_cfg = self.config.get('platforms', {}).get('platform_a', {})
                 check_url = platform_cfg.get('base_url', '')
 
             headers = self.get_random_headers()
