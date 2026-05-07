@@ -219,6 +219,17 @@ class YBTYProvider(BaseProvider):
 
         odds = match_data.get("oddsV2", {}).get("singleWin", {})
 
+        # 根据 isStart 和 periodStatus 判断实际比赛状态
+        is_start = match_data.get("isStart", False)
+        period_status = match_data.get("periodStatus", "")
+
+        if is_start and period_status:
+            match_status = "进行中"
+        elif is_start and not period_status:
+            match_status = "已结束"
+        else:
+            match_status = "未开始"
+
         return {
             "mid": match_id,
             "league_name": league_name,
@@ -226,7 +237,8 @@ class YBTYProvider(BaseProvider):
             "away_team": away_team,
             "sport_type": sport_type,
             "match_time": match_data.get("startAt", ""),
-            "match_status": "未开始",
+            "match_status": match_status,
+            "raw_status": f"isStart={is_start},liveStatus={match_data.get('liveStatus')},period={period_status}",
             "home_win_odds": odds.get("homeWin"),
             "draw_odds": odds.get("invincible"),
             "away_win_odds": odds.get("awayWin"),
