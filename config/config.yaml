@@ -88,10 +88,54 @@ spider:
         enabled: true     # 设为true启用cookie登录
         cookie_file: "data/platform_a_cookies.json"  # cookie文件路径
     platform_b:
-      name: "平台B"
-      base_url: "https://example-b.com"
-      odds_endpoint: "/sports/odds"
+      name: "万博体育"
+      base_url: "https://www.yewlwcuj.com:51300/"
+      login_url: "/login"
+      login_api: ""
+      login_verify_endpoint: ""
+      login_verify_header: "Cookie"
+      odds_endpoint: "/sports/football"
       timeout: 30
+      credentials:
+        username: "hua1212a1"
+        password: "baihua920728"
+      cookie_login:
+        enabled: true
+        cookie_file: "data/platform_b_cookies.json"
+      captcha:
+        enabled: false
+        type: "none"
+        retry_limit: 3
+      click_captcha:
+        enabled: true
+        ocr_engine: "ddddocr"
+        use_yolo: false
+        yolo_model: "yolov8n.pt"
+        max_retries: 3
+        click_delay_min: 0.3
+        click_delay_max: 0.8
+        detect_timeout: 5
+        manual_timeout: 90
+      selectors:
+        match_container: "div.match-list, table.match-table, .event-list, .sports-table, div[class*='match']"
+        match_row: "div.match-item, tr.match-row, .event-item, tr[class*='match'], tbody tr, .table-body > div"
+        league_name: ".league-name, .competition, td.league, .event-league, span[class*='league']"
+        home_team: ".home-team, .team-home, td.home span, .team-a, span[class*='home']"
+        away_team: ".away-team, .team-away, td.away span, .team-b, span[class*='away']"
+        match_time: ".match-time, .kickoff, td.time, .event-time, span[class*='time']"
+        match_status: ".match-status, .status, td.status, .event-status, span[class*='status']"
+        odds_1x2: ".odds-1x2, .match-odds, td.odds, .odds-container, div[class*='odds']"
+        home_odds: ".home-odds, .odds-home, td.home-odds, .odds-1, span[class*='home']"
+        draw_odds: ".draw-odds, .odds-draw, td.draw-odds, .odds-x, span[class*='draw']"
+        away_odds: ".away-odds, .odds-away, td.away-odds, .odds-2, span[class*='away']"
+        handicap_line: ".handicap-line, .over-under-line, .line, span[class*='line']"
+        over_odds: ".over-odds, .odds-over, .odds-big, span[class*='over']"
+        under_odds: ".under-odds, .odds-under, .odds-small, span[class*='under']"
+      use_playwright: true
+      playwright:
+        headless: true
+        wait_selector: "div.match-list, table.match-table, .sports-table, div[class*='match']"
+        wait_timeout_ms: 15000
 
 # 赛事匹配配置
 matching:

@@ -50,6 +50,12 @@ class DatabaseInitializer:
                 # 创建赔率历史记录表
                 self._create_odds_record_table(cursor)
 
+                # 创建未匹配赛事表
+                self._create_unmatched_matches_table(cursor)
+
+                # 创建套利历史记录表
+                self._create_arbitrage_history_table(cursor)
+
                 conn.commit()
                 self.logger.info("数据库初始化成功")
                 return True
@@ -107,6 +113,38 @@ class DatabaseInitializer:
 
         cursor.execute(create_table_sql)
         self.logger.debug("创建odds_record表")
+
+    def _create_unmatched_matches_table(self, cursor):
+        cursor.execute("""
+        CREATE TABLE IF NOT EXISTS unmatched_matches (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            platform TEXT NOT NULL,
+            league_name TEXT NOT NULL,
+            home_team TEXT NOT NULL,
+            away_team TEXT NOT NULL,
+            match_time TEXT NOT NULL,
+            match_status TEXT NOT NULL,
+            record_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+        """)
+
+    def _create_arbitrage_history_table(self, cursor):
+        cursor.execute("""
+        CREATE TABLE IF NOT EXISTS arbitrage_history (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            match_id INTEGER,
+            bet_type TEXT NOT NULL,
+            total_principal REAL,
+            bet1_amount REAL,
+            bet2_amount REAL,
+            bet1_odds REAL,
+            bet2_odds REAL,
+            fixed_profit REAL,
+            profit_rate REAL,
+            odds_difference REAL,
+            record_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+        """)
 
     def create_indexes(self) -> bool:
         """

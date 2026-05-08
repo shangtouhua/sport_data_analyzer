@@ -332,6 +332,55 @@ class ArbitrageCalculator:
 
         return portfolio
 
+    def calculate_three_way_arbitrage(self, match_pair: Dict[str, Any],
+                                       principal: Optional[float] = None) -> Optional[Dict[str, Any]]:
+        """计算三向套利（胜平负全覆盖）：从两平台各选最优赔率组合"""
+        if principal is None:
+            principal = self.default_principal
+        else:
+            principal = Decimal(str(principal))
+        plat_a = match_pair['platform_a']
+        plat_b = match_pair['platform_b']
+        best_home = max(plat_a.get('home_win_odds') or 0, plat_b.get('home_win_odds') or 0)
+        best_draw = max(plat_a.get('draw_odds') or 0, plat_b.get('draw_odds') or 0)
+        best_away = max(plat_a.get('away_win_odds') or 0, plat_b.get('away_win_odds') or 0)
+        if best_home <= 1 or best_draw <= 1 or best_away <= 1:
+            return None
+        home_d, draw_d, away_d = Decimal(str(best_home)), Decimal(str(best_draw)), Decimal(str(best_away))
+        total_prob = Decimal('1') / home_d + Decimal('1') / draw_d + Decimal('1') / away_d
+        if total_prob >= Decimal('1'):
+            return None
+        inv = total_prob
+        bet_home = principal / (home_d * inv)
+        bet_draw = principal / (draw_d * inv)
+        bet_away = principal / (away_d * inv)
+        fixed_return = bet_home * home_d
+        fixed_profit = fixed_return - principal
+        profit_rate = (fixed_profit / principal) * Decimal('100')
+        if profit_rate < self.profit_threshold:
+            return None
+        return {
+            'bet_type': 'three_way_1x2',
+            'total_principal': float(principal),
+            'bet_home_amount': float(bet_home),
+            'bet_draw_amount': float(bet_draw),
+            'bet_away_amount': float(bet_away),
+            'bet1_amount': float(bet_home),
+            'bet2_amount': float(bet_draw),
+            'bet_home_odds': float(home_d),
+            'bet_draw_odds': float(draw_d),
+            'bet_away_odds': float(away_d),
+            'bet1_odds': float(home_d),
+            'bet2_odds': float(draw_d),
+            'fixed_return': float(fixed_return),
+            'fixed_profit': float(fixed_profit),
+            'profit_rate': float(profit_rate),
+            'odds_difference': float(abs(home_d - away_d)),
+            'source_home': 'platform_a' if plat_a.get('home_win_odds') == best_home else 'platform_b',
+            'source_draw': 'platform_a' if plat_a.get('draw_odds') == best_draw else 'platform_b',
+            'source_away': 'platform_a' if plat_a.get('away_win_odds') == best_away else 'platform_b',
+        }
+
     def validate_arbitrage_data(self, opportunity: Dict[str, Any]) -> bool:
         """
         验证套利数据的有效性

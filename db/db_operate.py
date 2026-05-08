@@ -211,8 +211,8 @@ class DatabaseOperator:
         """
         query = """
         SELECT mi.* FROM match_info mi
-        LEFT JOIN odds_record or ON mi.match_id = or.match_id AND or.platform = ?
-        WHERE or.record_id IS NULL
+        LEFT JOIN odds_record odr ON mi.match_id = odr.match_id AND odr.platform = ?
+        WHERE odr.record_id IS NULL
         ORDER BY mi.match_time
         """
 
@@ -337,6 +337,104 @@ class DatabaseOperator:
         except Exception as e:
             self.logger.error(f"数据导出失败: {str(e)}")
             return False
+
+    def export_to_csv(self, filename: str) -> bool:
+        """导出数据为CSV格式"""
+        import csv
+        try:
+            query = """
+            SELECT
+                mi.match_id, mi.league_name, mi.home_team, mi.away_team,
+                mi.match_time, mi.match_status,
+                odr.platform, odr.home_win_odds, odr.draw_odds, odr.away_win_odds,
+                odr.big_ball_odds, odr.small_ball_odds, odr.handicap, odr.collect_time
+            FROM match_info mi
+            LEFT JOIN odds_record odr ON mi.match_id = odr.match_id
+            ORDER BY mi.match_time DESC, odr.collect_time DESC
+            """
+            results = self._execute_query(query)
+            if not results:
+                self.logger.warning("无数据可导出")
+                return False
+            rows = [dict(r) for r in results]
+            with open(filename, 'w', newline='', encoding='utf-8-sig') as f:
+                writer = csv.DictWriter(f, fieldnames=rows[0].keys())
+                writer.writeheader()
+                writer.writerows(rows)
+            self.logger.info(f"CSV导出成功: {filename}")
+            return True
+        except Exception as e:
+            self.logger.error(f"CSV导出失败: {str(e)}")
+            return False
+
+    def save_unmatched_match(self, match_data: Dict[str, Any]) -> bool:
+        """将未匹配的赛事存入 unmatched_matches 表"""
+        try:
+            query = """
+            INSERT OR IGNORE INTO unmatched_matches
+            (platform, league_name, home_team, away_team, match_time, match_status, record_time)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """
+            params = (
+                match_data.get('platform', ''),
+                match_data.get('league_name', ''),
+                match_data.get('home_team', ''),
+                match_data.get('away_team', ''),
+                match_data.get('match_time', ''),
+                match_data.get('match_status', ''),
+                match_data.get('collect_time', datetime.now().strftime('%Y-%m-%d %H:%M:%S')),
+            )
+            return self._execute_update(query, params)
+        except Exception as e:
+            self.logger.error(f"保存未匹配赛事失败: {str(e)}")
+            return False
+
+    def get_unmatched_matches(self, limit: int = 50) -> List[Dict[str, Any]]:
+        """获取未匹配赛事列表"""
+        query = """
+        SELECT * FROM unmatched_matches
+        ORDER BY record_time DESC LIMIT ?
+        """
+        results = self._execute_query(query, (limit,))
+        return [dict(r) for r in results]
+
+    def save_arbitrage_opportunity(self, opportunity: Dict[str, Any]) -> bool:
+        """保存套利机会记录到数据库"""
+        try:
+            match_info = opportunity.get('match_info', {})
+            query = """
+            INSERT OR IGNORE INTO arbitrage_history
+            (match_id, bet_type, total_principal, bet1_amount, bet2_amount,
+             bet1_odds, bet2_odds, fixed_profit, profit_rate, odds_difference, record_time)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """
+            match_id = match_info.get('match_id', 0) if isinstance(match_info, dict) else 0
+            params = (
+                match_id if match_id else 0,
+                opportunity.get('bet_type', ''),
+                opportunity.get('total_principal', 0),
+                opportunity.get('bet1_amount', 0),
+                opportunity.get('bet2_amount', 0),
+                opportunity.get('bet1_odds', 0),
+                opportunity.get('bet2_odds', 0),
+                opportunity.get('fixed_profit', 0),
+                opportunity.get('profit_rate', 0),
+                opportunity.get('odds_difference', 0),
+                datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+            )
+            return self._execute_update(query, params)
+        except Exception as e:
+            self.logger.error(f"保存套利机会失败: {str(e)}")
+            return False
+
+    def get_arbitrage_history(self, limit: int = 50) -> List[Dict[str, Any]]:
+        """获取套利历史记录"""
+        query = """
+        SELECT * FROM arbitrage_history
+        ORDER BY record_time DESC LIMIT ?
+        """
+        results = self._execute_query(query, (limit,))
+        return [dict(r) for r in results]
 
     def cleanup_old_data(self, days: int = 30) -> int:
         """
