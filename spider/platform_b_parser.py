@@ -22,6 +22,22 @@ from bs4 import BeautifulSoup
 from .base_spider import BaseSpider
 
 
+# 稳定的浏览器启动参数，避免资源加载挂起导致页面无法完整展示
+STABLE_BROWSER_ARGS = [
+    '--no-sandbox',
+    '--disable-blink-features=AutomationControlled',
+    '--disable-dev-shm-usage',
+    '--disable-gpu',
+    '--disable-extensions',
+    '--disable-background-timer-throttling',
+    '--disable-features=TranslateUI',
+    '--ignore-certificate-errors',
+]
+
+# 页面加载时拦截的非必要资源类型，减少网络挂起
+BLOCKED_RESOURCE_TYPES = frozenset({'image', 'font', 'media'})
+
+
 class PlatformBParser(BaseSpider):
     """平台B解析器 (万博体育)，支持Playwright登录、cookie持久化、CSS选择器灵活配置"""
 
@@ -38,13 +54,14 @@ class PlatformBParser(BaseSpider):
         self.captcha_config = platform_config.get('captcha', {})
         self.click_captcha_config = platform_config.get('click_captcha', {})
         self.cookie_config = platform_config.get('cookie_login', {})
+        self.login_popup_config = platform_config.get('login_popup', {})
         self.use_playwright_flag = platform_config.get('use_playwright', True)
         self.pw_config = platform_config.get('playwright', {})
         self.selectors = platform_config.get('selectors', {})
         self.timeout = platform_config.get('timeout', 30)
 
-        self.full_login_url = f"{self.base_url}{self.login_api}" if self.login_api else f"{self.base_url}{self.login_url}"
-        self.full_odds_url = f"{self.base_url}{self.odds_endpoint}"
+        self.full_login_url = f"{self.base_url}{self.login_api.lstrip('/')}" if self.login_api else f"{self.base_url}{self.login_url.lstrip('/')}"
+        self.full_odds_url = f"{self.base_url}{self.odds_endpoint.lstrip('/')}"
 
     # ==================== 主入口 ====================
 
@@ -152,7 +169,7 @@ class PlatformBParser(BaseSpider):
             return False
 
     async def _verify_login_state(self) -> bool:
-        """验证万博体育登录状态"""
+        """验证万博体育登录状态（检查 /app/index 页面是否已登录）"""
         try:
             verify_url = self.config.get('platforms', {}).get('platform_b', {}).get('login_verify_endpoint', '')
             if verify_url:
@@ -167,11 +184,11 @@ class PlatformBParser(BaseSpider):
                 except Exception:
                     pass
 
-            # 回退：访问首页检查
+            # 回退：访问 /app/index 检查登录状态
             headers = self.get_random_headers()
             headers['Accept'] = 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8'
             async with self.session.get(
-                self.base_url, headers=headers, allow_redirects=False, timeout=15
+                self.full_login_url, headers=headers, allow_redirects=False, timeout=15
             ) as resp:
                 if resp.status in (302, 301, 401, 403):
                     return False
@@ -180,9 +197,17 @@ class PlatformBParser(BaseSpider):
                 body = await resp.text()
                 if self._is_forbidden_page(body):
                     return False
+                # 已登录：页面中不应包含密码输入框
                 has_password = 'type="password"' in body
+                if has_password:
+                    return False
+                # 检查已登录标识
+                logged_in_keywords = ['我的账户', '个人中心', '会员中心', '账户余额', '退出']
+                if any(kw in body for kw in logged_in_keywords):
+                    return True
+                # 无密码字段且无登录标题，认为已登录
                 has_login_title = bool(re.search(r'<title[^>]*>.*?(登录|login).*?</title>', body, re.I))
-                if has_password or has_login_title:
+                if has_login_title:
                     return False
                 return True
         except Exception as e:
@@ -190,21 +215,27 @@ class PlatformBParser(BaseSpider):
             return False
 
     async def _login_with_playwright(self) -> bool:
-        """使用Playwright自动化登录万博体育"""
+        """使用Playwright自动化登录万博体育（弹窗登录模式）
+
+        流程：
+        1. 打开 https://www.yewlwcuj.com:51300/app/index
+        2. 等待登录弹窗出现
+        3. 在弹窗中自动填写账号密码
+        4. 提交登录
+        5. 处理验证码
+        6. 等待弹窗关闭，确认登录成功
+        7. 保存cookie
+        """
         try:
             from playwright.async_api import async_playwright
 
-            self.logger.info(f"Playwright登录: {self.full_login_url}")
+            self.logger.info(f"Playwright弹窗登录: {self.full_login_url}")
 
             async with async_playwright() as pw:
                 browser = await pw.chromium.launch(
                     channel='chrome',
                     headless=False,
-                    args=[
-                        '--no-sandbox',
-                        '--disable-blink-features=AutomationControlled',
-                        '--disable-web-security',
-                    ]
+                    args=STABLE_BROWSER_ARGS,
                 )
                 context = await browser.new_context(
                     user_agent=random.choice(self.user_agents) if self.user_agents else (
@@ -216,75 +247,288 @@ class PlatformBParser(BaseSpider):
                 )
                 await context.add_init_script("""
                     Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
-                    Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
+                    Object.defineProperty(navigator, 'plugins', {
+                        get: () => {
+                            const plugins = [1, 2, 3, 4, 5];
+                            plugins.item = () => null;
+                            plugins.namedItem = () => null;
+                            plugins.refresh = () => {};
+                            return plugins;
+                        }
+                    });
+                    Object.defineProperty(navigator, 'languages', {
+                        get: () => ['zh-CN', 'zh', 'en-US', 'en']
+                    });
+                    Object.defineProperty(navigator, 'platform', {
+                        get: () => 'Win32'
+                    });
+                    Object.defineProperty(navigator, 'hardwareConcurrency', {
+                        get: () => 8
+                    });
+                    Object.defineProperty(navigator, 'deviceMemory', {
+                        get: () => 8
+                    });
+                    delete window.__playwright__binding__;
+                    delete window.__pwInitScripts;
+                    window.chrome = {
+                        runtime: {},
+                        loadTimes: function() {},
+                        csi: function() {},
+                        app: {}
+                    };
+                    const originalQuery = window.navigator.permissions.query;
+                    window.navigator.permissions.query = (parameters) => (
+                        parameters.name === 'notifications' ?
+                        Promise.resolve({ state: Notification.permission }) :
+                        originalQuery(parameters)
+                    );
+                    Object.defineProperty(navigator, 'connection', {
+                        get: () => ({
+                            effectiveType: '4g',
+                            rtt: 50,
+                            downlink: 10,
+                            saveData: false
+                        })
+                    });
                 """)
 
                 page = await context.new_page()
                 page.set_default_timeout(60000)
 
-                # 导航到登录页
-                self.logger.info("正在打开万博体育登录页面...")
+                # 拦截非必要资源（图片/字体/媒体），减少网络挂起
+                await page.route('**/*', self._block_resource)
+                # 收集浏览器控制台错误，便于排查页面加载问题
+                console_errors = []
+                page.on('console', lambda msg: console_errors.append(
+                    f"[{msg.type}] {msg.text}"
+                ) if msg.type in ('error', 'warning') else None)
+                page.on('pageerror', lambda err: self.logger.error(f"浏览器JS错误: {err}"))
+
+                # 导航到 /app/index（登录弹窗在此页面）
+                # 使用 domcontentloaded 替代 networkidle：后者会因 CDN 资源不可达而永久挂起
+                self.logger.info("正在打开万博体育首页 (弹窗登录)...")
                 try:
-                    await page.goto(self.full_login_url, wait_until='networkidle', timeout=60000)
+                    await page.goto(self.full_login_url, wait_until='domcontentloaded', timeout=30000)
                 except Exception:
-                    self.logger.warning("登录页加载超时，尝试首页...")
-                    await page.goto(self.base_url, wait_until='networkidle', timeout=60000)
+                    self.logger.warning("首页加载超时，尝试 base_url...")
+                    try:
+                        await page.goto(self.base_url, wait_until='domcontentloaded', timeout=30000)
+                    except Exception:
+                        self.logger.error("base_url 也无法加载，可能IP被封锁")
+                        await self._save_failure_screenshot(page, 'page_load_failed')
 
                 await page.wait_for_timeout(3000)
 
-                # 检查是否触发IP限制页
+                # 检查IP限制
                 if await self._detect_forbidden_page(page):
                     self.logger.error("万博体育检测到海外IP，登录被阻止")
-                    self.logger.error("请使用中国IP或VPN后重试")
+                    await self._save_failure_screenshot(page, 'forbidden')
                     await browser.close()
                     return False
 
-                # 检查是否已经登录（可能通过记住密码）
-                current_url = page.url
-                if '/login' not in current_url and 'login' not in current_url.lower():
-                    self.logger.info("检测到已登录状态（可能记住密码）")
-                    return await self._save_playwright_cookies(context, browser)
+                # 等待登录弹窗出现
+                login_popup = await self._wait_for_login_popup(page)
+                if login_popup is None:
+                    # 弹窗未出现，检查是否已登录
+                    self.logger.info("未检测到登录弹窗，检查是否已登录...")
+                    if await self._check_logged_in_on_index(page):
+                        self.logger.info("检测到已登录状态（cookie有效）")
+                        return await self._save_playwright_cookies(context, browser)
+                    self.logger.error("未检测到登录弹窗且未登录，无法继续")
+                    if console_errors:
+                        self.logger.warning(f"浏览器控制台错误: {console_errors[:10]}")
+                    await self._save_failure_screenshot(page, 'no_login_popup')
+                    await browser.close()
+                    return False
 
-                # 填写登录表单
-                await self._fill_login_form(page)
+                # 在弹窗中填写登录表单
+                password_field = await self._fill_login_form_in_popup(page, login_popup)
+                if password_field is None:
+                    self.logger.error("无法在弹窗中找到登录表单字段")
+                    if console_errors:
+                        self.logger.warning(f"浏览器控制台错误: {console_errors[:10]}")
+                    await self._save_failure_screenshot(page, 'no_form_fields')
+                    await browser.close()
+                    return False
 
-                # 检测并处理点击式验证码
+                # 处理点击式验证码
                 if self.click_captcha_config.get('enabled', False):
                     await self._handle_click_captcha(page)
 
-                # 等待登录完成
-                self.logger.info("等待登录完成（30秒）...")
-                try:
-                    await page.wait_for_url(
-                        lambda url: '/login' not in url and 'login' not in url.lower(),
-                        timeout=30000
-                    )
-                except Exception:
-                    pass
-                await page.wait_for_timeout(2000)
+                # 提交登录表单
+                await self._submit_login_form(page, password_field)
+                await page.wait_for_timeout(3000)
 
-                # 二次验证：如果还在登录页，手动等待
-                if '/login' in page.url or 'login' in page.url.lower():
-                    self.logger.warning("自动登录未完成，请在浏览器中手动完成登录")
-                    self.logger.info("等待手动登录（最多90秒）...")
-                    try:
-                        await page.wait_for_url(
-                            lambda url: '/login' not in url and 'login' not in url.lower(),
-                            timeout=90000
-                        )
-                    except Exception:
-                        self.logger.error("手动登录超时")
-                        await browser.close()
-                        return False
+                # 检查登录错误
+                if await self._detect_login_error(page):
+                    self.logger.error("检测到登录错误提示（账号或密码错误等）")
+                    await self._save_failure_screenshot(page, 'login_error')
+                    await browser.close()
+                    return False
 
-                self.logger.info(f"登录完成，当前URL: {page.url}")
-                return await self._save_playwright_cookies(context, browser)
+                # 等待弹窗关闭（登录成功标志）
+                self.logger.info("等待登录弹窗关闭...")
+                if not await self._wait_for_popup_close(page, login_popup):
+                    self.logger.warning("弹窗未自动关闭，尝试手动等待...")
+                    await page.wait_for_timeout(5000)
+
+                # 验证登录状态
+                if await self._check_logged_in_on_index(page):
+                    self.logger.info(f"弹窗登录成功，当前URL: {page.url}")
+                    return await self._save_playwright_cookies(context, browser)
+
+                self.logger.error("登录后验证失败，可能登录未成功")
+                if console_errors:
+                    self.logger.warning(f"浏览器控制台错误 ({len(console_errors)}): {console_errors[:10]}")
+                await self._save_failure_screenshot(page, 'login_verify_failed')
+                await browser.close()
+                return False
 
         except ImportError:
             self.logger.error("Playwright 未安装，请运行: pip install playwright && playwright install")
             return False
         except Exception as e:
-            self.logger.error(f"Playwright登录失败: {str(e)}")
+            import traceback
+            self.logger.error(f"Playwright弹窗登录失败: {str(e)}\n{traceback.format_exc()}")
+
+    async def _wait_for_login_popup(self, page) -> Optional[Any]:
+        """等待登录弹窗出现并返回弹窗元素"""
+        popup_selectors = self.login_popup_config.get('dialog_selectors', [
+            '.modal', '.dialog', '[class*="login-dialog"]', '[class*="login-modal"]',
+            '.ant-modal', '.el-dialog', 'div[class*="login"]',
+        ])
+        popup_timeout = self.login_popup_config.get('popup_timeout_ms', 10000)
+
+        for sel in popup_selectors:
+            try:
+                el = await page.wait_for_selector(sel, timeout=popup_timeout)
+                if el and await el.is_visible():
+                    self.logger.info(f"检测到登录弹窗 (选择器: {sel})")
+                    return el
+            except Exception:
+                continue
+
+        # 回退：查找任何包含密码输入框的可见容器
+        try:
+            pw_input = await page.wait_for_selector('input[type="password"]', timeout=5000)
+            if pw_input and await pw_input.is_visible():
+                self.logger.info("通过密码输入框定位到登录弹窗")
+                return pw_input
+        except Exception:
+            pass
+
+        return None
+
+    async def _fill_login_form_in_popup(self, page, popup_element) -> Optional[Any]:
+        """在登录弹窗中仿人填写账号密码，返回密码输入框"""
+        username = self.credentials.get('username', '')
+        password = self.credentials.get('password', '')
+
+        username_selectors = [
+            'input[placeholder*="账号" i]', 'input[placeholder*="用户" i]',
+            'input[placeholder*="手机" i]', 'input[placeholder*="邮箱" i]',
+            'input[name="username"]', 'input[name="account"]', 'input[name="phone"]',
+            'input[autocomplete="username"]', 'input[id*="username"]', 'input[id*="account"]',
+        ]
+        username_field = None
+        for sel in username_selectors:
+            try:
+                inp = await page.wait_for_selector(sel, timeout=3000)
+                if inp and await inp.is_visible():
+                    username_field = inp
+                    break
+            except Exception:
+                continue
+
+        if not username_field:
+            inputs = await page.query_selector_all('input:not([type="password"]):not([type="hidden"])')
+            for inp in inputs:
+                if await inp.is_visible():
+                    username_field = inp
+                    break
+
+        password_selectors = [
+            'input[type="password"]', 'input[placeholder*="密码" i]',
+            'input[name="password"]', 'input[autocomplete="current-password"]',
+        ]
+        password_field = None
+        for sel in password_selectors:
+            try:
+                inp = await page.wait_for_selector(sel, timeout=3000)
+                if inp and await inp.is_visible():
+                    password_field = inp
+                    break
+            except Exception:
+                continue
+
+        if not username_field or not password_field:
+            return None
+
+        # 仿人输入用户名
+        await username_field.click()
+        await page.wait_for_timeout(random.randint(200, 500))
+        await page.keyboard.type(username, delay=random.randint(50, 150))
+        self.logger.info("已在弹窗中输入用户名")
+
+        await page.wait_for_timeout(random.randint(300, 800))
+
+        # 仿人输入密码
+        await password_field.click()
+        await page.wait_for_timeout(random.randint(200, 500))
+        await page.keyboard.type(password, delay=random.randint(50, 150))
+        self.logger.info("已在弹窗中输入密码")
+
+        await page.wait_for_timeout(random.randint(300, 600))
+        return password_field
+
+    async def _wait_for_popup_close(self, page, popup_element) -> bool:
+        """等待登录弹窗关闭"""
+        max_wait = 30
+        start = time.time()
+        while time.time() - start < max_wait:
+            try:
+                # 检测弹窗是否已隐藏
+                is_visible = await popup_element.is_visible()
+                if not is_visible:
+                    self.logger.info("登录弹窗已关闭")
+                    return True
+            except Exception:
+                # popup_element 如果不再存在于DOM
+                self.logger.info("登录弹窗已从DOM移除")
+                return True
+
+            # 同时检查密码输入框是否还可见
+            try:
+                pw = await page.query_selector('input[type="password"]')
+                if pw and not await pw.is_visible():
+                    self.logger.info("密码输入框不可见，弹窗已关闭")
+                    return True
+            except Exception:
+                pass
+
+            await asyncio.sleep(1)
+        return False
+
+    async def _check_logged_in_on_index(self, page) -> bool:
+        """检查 /app/index 页面是否处于已登录状态"""
+        try:
+            # 已登录状态下不应出现密码输入框
+            pw_input = await page.query_selector('input[type="password"]')
+            if pw_input and await pw_input.is_visible():
+                return False
+
+            # 检查已登录特征
+            logged_in_indicators = [
+                '我的账户', '个人中心', '会员中心', '账户余额',
+                '退出', 'logout', '用户中心',
+            ]
+            body_text = await page.evaluate("() => document.body.innerText || ''")
+            for kw in logged_in_indicators:
+                if kw in body_text:
+                    self.logger.info(f"检测到已登录标识: '{kw}'")
+                    return True
+            return False
+        except Exception:
             return False
 
     async def _detect_forbidden_page(self, page) -> bool:
@@ -297,57 +541,107 @@ class PlatformBParser(BaseSpider):
         except Exception:
             return False
 
-    async def _fill_login_form(self, page):
-        """填写万博体育登录表单"""
-        username = self.credentials.get('username', '')
-        password = self.credentials.get('password', '')
-        filled = False
+    async def _detect_login_error(self, page) -> bool:
+        """检测登录页面上的错误提示信息"""
+        try:
+            error_keywords = [
+                '账号或密码错误', '用户名或密码错误', '密码错误', '账号错误',
+                '登录失败', '验证失败', '账户不存在', '账号已锁定', '账号被冻结',
+                'Invalid credentials', 'Login failed', 'Wrong password', 'incorrect',
+            ]
+            page_text = await page.evaluate("() => document.body.innerText || ''")
+            page_text_lower = page_text.lower()
+            for keyword in error_keywords:
+                if keyword.lower() in page_text_lower:
+                    self.logger.warning(f"检测到错误提示关键词: '{keyword}'")
+                    snippet = page_text[:500]
+                    self.logger.info(f"页面文本预览: {snippet}")
+                    return True
+            return False
+        except Exception as e:
+            self.logger.debug(f"检测登录错误异常: {e}")
+            return False
 
-        username_selectors = [
-            'input[placeholder*="账号" i]', 'input[placeholder*="用户" i]',
-            'input[placeholder*="手机" i]', 'input[placeholder*="邮箱" i]',
-            'input[name="username"]', 'input[name="account"]', 'input[name="phone"]',
-            'input[autocomplete="username"]', 'input[id*="username"]', 'input[id*="account"]',
+    async def _submit_login_form(self, page, password_field) -> bool:
+        """多重策略提交登录表单，任一种成功即返回True"""
+        strategies = [
+            ('Enter键提交', self._submit_by_enter),
+            ('JS表单提交', self._submit_by_js_submit),
+            ('dispatchEvent点击', self._submit_by_dispatch_event),
+            ('按钮直接点击', self._submit_by_button_click),
         ]
-        for sel in username_selectors:
+
+        for name, strategy in strategies:
             try:
-                inp = await page.wait_for_selector(sel, timeout=3000)
-                if inp:
-                    await inp.fill(username)
-                    self.logger.info(f"已填写用户名 ({sel})")
-                    filled = True
-                    break
-            except Exception:
-                continue
+                if await strategy(page, password_field):
+                    self.logger.info(f"登录提交成功 ({name})")
+                    return True
+                self.logger.debug(f"提交策略 '{name}' 已执行，等待页面响应...")
+            except Exception as e:
+                self.logger.debug(f"提交策略 '{name}' 异常: {e}")
 
-        if not filled:
-            try:
-                inputs = await page.query_selector_all('input:not([type="password"]):not([type="hidden"])')
-                for inp in inputs:
-                    if await inp.is_visible():
-                        await inp.fill(username)
-                        self.logger.info("已填写用户名 (智能回退)")
-                        filled = True
-                        break
-            except Exception:
-                pass
+        self.logger.warning("所有提交策略均失败，无法提交登录表单")
+        return False
 
-        pw_selectors = [
-            'input[type="password"]', 'input[placeholder*="密码" i]',
-            'input[name="password"]', 'input[autocomplete="current-password"]',
-        ]
-        for sel in pw_selectors:
-            try:
-                inp = await page.wait_for_selector(sel, timeout=3000)
-                if inp:
-                    await inp.fill(password)
-                    self.logger.info("已填写密码")
-                    break
-            except Exception:
-                continue
+    async def _submit_by_enter(self, page, password_field) -> bool:
+        """在密码框按Enter提交"""
+        await password_field.focus()
+        await page.wait_for_timeout(random.randint(100, 300))
+        await page.keyboard.press('Enter')
+        return True
 
-        await page.wait_for_timeout(500)
+    async def _submit_by_js_submit(self, page, password_field) -> bool:
+        """通过JavaScript直接提交表单"""
+        result = await page.evaluate("""
+            () => {
+                const pw = document.querySelector('input[type="password"]');
+                if (!pw) return false;
+                const form = pw.closest('form');
+                if (form) {
+                    form.submit();
+                    return true;
+                }
+                // 尝试触发最近的button
+                const allBtns = document.querySelectorAll('button');
+                for (const b of allBtns) {
+                    if (b.textContent.includes('登录') || b.textContent.includes('登入') || b.type === 'submit') {
+                        b.click();
+                        return true;
+                    }
+                }
+                return false;
+            }
+        """)
+        return bool(result)
 
+    async def _submit_by_dispatch_event(self, page, password_field) -> bool:
+        """通过dispatchEvent模拟真实点击事件"""
+        result = await page.evaluate("""
+            () => {
+                const allBtns = document.querySelectorAll(
+                    'button, .login-btn, .submit-btn, input[type="submit"]'
+                );
+                let btn = null;
+                for (const b of allBtns) {
+                    if (b.textContent.includes('登录') || b.textContent.includes('登入') ||
+                        b.type === 'submit' || b.className.includes('login')) {
+                        btn = b;
+                        break;
+                    }
+                }
+                if (!btn) return false;
+                const rect = btn.getBoundingClientRect();
+                const opts = { bubbles: true, cancelable: true, clientX: rect.x + 10, clientY: rect.y + 5 };
+                btn.dispatchEvent(new MouseEvent('mousedown', opts));
+                btn.dispatchEvent(new MouseEvent('mouseup', opts));
+                btn.dispatchEvent(new MouseEvent('click', opts));
+                return true;
+            }
+        """)
+        return bool(result)
+
+    async def _submit_by_button_click(self, page, password_field) -> bool:
+        """通过Playwright原生click方法点击按钮"""
         btn_selectors = [
             'button[type="submit"]', 'button:has-text("登录")', 'button:has-text("登入")',
             'button:has-text("LOGIN")', 'a:has-text("登录")', '.login-btn', '.submit-btn',
@@ -356,12 +650,9 @@ class PlatformBParser(BaseSpider):
         for sel in btn_selectors:
             btn = await page.query_selector(sel)
             if btn and await btn.is_visible():
-                await btn.click()
-                self.logger.info("已点击登录按钮")
-                return
-
-        self.logger.info("未找到登录按钮，尝试Enter提交")
-        await page.keyboard.press('Enter')
+                await btn.click(force=True)
+                return True
+        return False
 
     async def _handle_click_captcha(self, page):
         """处理点击式验证码"""
@@ -447,7 +738,7 @@ class PlatformBParser(BaseSpider):
             async with async_playwright() as pw:
                 browser = await pw.chromium.launch(
                     channel='chrome', headless=headless,
-                    args=['--no-sandbox', '--disable-blink-features=AutomationControlled'],
+                    args=STABLE_BROWSER_ARGS,
                 )
                 context = await browser.new_context(
                     user_agent=random.choice(self.user_agents) if self.user_agents else (
@@ -473,10 +764,19 @@ class PlatformBParser(BaseSpider):
                 page = await context.new_page()
                 page.set_default_timeout(30000)
 
+                # 拦截非必要资源 + 控制台错误收集
+                await page.route('**/*', self._block_resource)
+                console_errors = []
+                page.on('console', lambda msg: console_errors.append(
+                    f"[{msg.type}] {msg.text}"
+                ) if msg.type in ('error', 'warning') else None)
+
                 try:
-                    await page.goto(self.full_odds_url, wait_until='networkidle', timeout=60000)
+                    await page.goto(self.full_odds_url, wait_until='domcontentloaded', timeout=30000)
                 except Exception:
                     self.logger.warning("页面加载超时，尝试获取已有内容")
+                    if console_errors:
+                        self.logger.warning(f"浏览器控制台错误: {console_errors[:5]}")
 
                 try:
                     await page.wait_for_selector(wait_selector, timeout=wait_timeout)
@@ -487,6 +787,7 @@ class PlatformBParser(BaseSpider):
 
                 if await self._detect_forbidden_page(page):
                     self.logger.error("IP被万博封锁")
+                    await self._save_failure_screenshot(page, 'forbidden_page')
                     await browser.close()
                     return None
 
@@ -499,6 +800,28 @@ class PlatformBParser(BaseSpider):
         except Exception as e:
             self.logger.error(f"Playwright爬取失败: {e}")
             return None
+
+    async def _block_resource(self, route):
+        """拦截非必要资源（图片/字体/媒体），CSS仍放行以保证页面渲染"""
+        try:
+            if route.request.resource_type in BLOCKED_RESOURCE_TYPES:
+                await route.abort()
+            else:
+                await route.continue_()
+        except Exception:
+            pass  # 浏览器关闭时 route 已失效，忽略
+
+    async def _save_failure_screenshot(self, page, tag: str):
+        """登录或爬取失败时保存截图到 data/diagnosis/ 目录"""
+        try:
+            diag_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'data', 'diagnosis')
+            os.makedirs(diag_dir, exist_ok=True)
+            ts = time.strftime('%Y%m%d_%H%M%S')
+            filename = os.path.join(diag_dir, f'platform_b_{tag}_{ts}.png')
+            await page.screenshot(path=filename, full_page=False)
+            self.logger.info(f"失败截图已保存: {filename}")
+        except Exception as e:
+            self.logger.debug(f"保存截图失败: {e}")
 
     def _is_forbidden_page(self, html: str) -> bool:
         return '访问受限' in html or 'FORBIDDEN' in html or 'forbidden' in html.lower()[:200]

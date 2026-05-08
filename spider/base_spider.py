@@ -820,8 +820,11 @@ class BaseSpider:
                     args=[
                         '--no-sandbox',
                         '--disable-blink-features=AutomationControlled',
-                        '--disable-web-security',
-                    ]
+                        '--disable-dev-shm-usage',
+                        '--disable-gpu',
+                        '--disable-extensions',
+                        '--ignore-certificate-errors',
+                    ],
                 )
                 context = await browser.new_context(
                     user_agent=random.choice(self.user_agents) if self.user_agents else None,
@@ -839,7 +842,10 @@ class BaseSpider:
 
                 # 导航到登录页面
                 self.logger.info("正在打开登录页面...")
-                await page.goto(login_url, wait_until='networkidle', timeout=60000)
+                try:
+                    await page.goto(login_url, wait_until='domcontentloaded', timeout=30000)
+                except Exception:
+                    self.logger.warning("登录页面加载超时（domcontentloaded），尝试继续...")
                 await page.wait_for_timeout(2000)
 
                 # === 第1步：尝试自动填写登录表单（扩展多种选择器） ===

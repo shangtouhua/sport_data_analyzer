@@ -90,8 +90,21 @@ spider:
     platform_b:
       name: "万博体育"
       base_url: "https://www.yewlwcuj.com:51300/"
-      login_url: "/login"
+      login_url: "/app/index"
       login_api: ""
+      # 登录弹窗配置（万博体育在/app/index页面弹出登录对话框）
+      login_popup:
+        # 弹窗容器选择器
+        dialog_selectors:
+          - ".modal"
+          - ".dialog"
+          - "[class*='login-dialog']"
+          - "[class*='login-modal']"
+          - ".ant-modal"
+          - ".el-dialog"
+          - "div[class*='login']"
+        # 弹窗出现最大等待时间（毫秒）
+        popup_timeout_ms: 10000
       login_verify_endpoint: ""
       login_verify_header: "Cookie"
       odds_endpoint: "/sports/football"

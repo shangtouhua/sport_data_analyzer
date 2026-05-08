@@ -136,7 +136,14 @@ class IframeDataExtractor:
         async with async_playwright() as p:
             browser = await p.chromium.launch(
                 headless=headless,
-                args=['--no-sandbox', '--disable-blink-features=AutomationControlled'],
+                args=[
+                    '--no-sandbox',
+                    '--disable-blink-features=AutomationControlled',
+                    '--disable-dev-shm-usage',
+                    '--disable-gpu',
+                    '--disable-extensions',
+                    '--ignore-certificate-errors',
+                ],
             )
 
             context = await browser.new_context(
