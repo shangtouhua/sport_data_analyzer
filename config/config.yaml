@@ -89,7 +89,9 @@ spider:
         cookie_file: "data/platform_a_cookies.json"  # cookie文件路径
     platform_b:
       name: "万博体育"
-      base_url: "https://www.yewlwcuj.com:51300/"
+      base_url: "https://www.yewlwcuj.com:51300"
+      # 赔率数据页面URL（登录后跳转的域名，cookie与base_url共用）
+      odds_base_url: "https://cn.fhuhjdsp.com"
       login_url: "/app/index"
       login_api: ""
       # 登录弹窗配置（万博体育在/app/index页面弹出登录对话框）
@@ -107,7 +109,10 @@ spider:
         popup_timeout_ms: 10000
       login_verify_endpoint: ""
       login_verify_header: "Cookie"
-      odds_endpoint: "/sports/football"
+      odds_endpoint: "/sports/AISports?isWindow=true"
+      # HTTP代理配置（万博限制海外IP，需使用中国IP代理或VPN）
+      # 支持格式: http://host:port 或 socks5://host:port
+      proxy: ""
       timeout: 30
       credentials:
         username: "hua1212a1"

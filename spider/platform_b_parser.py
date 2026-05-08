@@ -46,7 +46,8 @@ class PlatformBParser(BaseSpider):
         self.platform_name = "platform_b"
 
         platform_config = config.get('platforms', {}).get('platform_b', {})
-        self.base_url = platform_config.get('base_url', '')
+        self.base_url = platform_config.get('base_url', '').rstrip('/')
+        self.odds_base_url = platform_config.get('odds_base_url', '').rstrip('/') or self.base_url
         self.login_url = platform_config.get('login_url', '/login')
         self.login_api = platform_config.get('login_api', '')
         self.odds_endpoint = platform_config.get('odds_endpoint', '/sports/football')
@@ -59,9 +60,10 @@ class PlatformBParser(BaseSpider):
         self.pw_config = platform_config.get('playwright', {})
         self.selectors = platform_config.get('selectors', {})
         self.timeout = platform_config.get('timeout', 30)
+        self.proxy = platform_config.get('proxy', '') or None
 
-        self.full_login_url = f"{self.base_url}{self.login_api.lstrip('/')}" if self.login_api else f"{self.base_url}{self.login_url.lstrip('/')}"
-        self.full_odds_url = f"{self.base_url}{self.odds_endpoint.lstrip('/')}"
+        self.full_login_url = f"{self.base_url}/{self.login_api.lstrip('/')}" if self.login_api else f"{self.base_url}/{self.login_url.lstrip('/')}"
+        self.full_odds_url = f"{self.odds_base_url}/{self.odds_endpoint.lstrip('/')}"
 
     # ==================== 主入口 ====================
 
@@ -161,19 +163,26 @@ class PlatformBParser(BaseSpider):
                         {name: value},
                         response_url=URL(self.base_url)
                     )
+                    # 如果赔率数据域名与登录域名不同，cookie也注入到数据域名
+                    if self.odds_base_url != self.base_url:
+                        self.session.cookie_jar.update_cookies(
+                            {name: value},
+                            response_url=URL(self.odds_base_url)
+                        )
 
-            self.logger.info(f"已从文件加载 {len(valid_cookies)} 个万博体育cookie")
+            self.logger.info(f"已从文件加载 {len(valid_cookies)} 个万博体育cookie"
+                             f"{' (已同步到两个域名)' if self.odds_base_url != self.base_url else ''}")
             return True
         except Exception as e:
             self.logger.warning(f"加载cookie文件失败: {str(e)}")
             return False
 
     async def _verify_login_state(self) -> bool:
-        """验证万博体育登录状态（检查 /app/index 页面是否已登录）"""
+        """验证万博体育登录状态（优先检查数据域名，回退登录域名）"""
         try:
             verify_url = self.config.get('platforms', {}).get('platform_b', {}).get('login_verify_endpoint', '')
             if verify_url:
-                full_url = f"{self.base_url}{verify_url}" if not verify_url.startswith('http') else verify_url
+                full_url = f"{self.base_url}/{verify_url.lstrip('/')}" if not verify_url.startswith('http') else verify_url
                 try:
                     async with self.session.get(full_url, headers=self.get_random_headers(),
                                                 allow_redirects=False, timeout=15) as resp:
@@ -184,32 +193,39 @@ class PlatformBParser(BaseSpider):
                 except Exception:
                     pass
 
-            # 回退：访问 /app/index 检查登录状态
-            headers = self.get_random_headers()
-            headers['Accept'] = 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8'
-            async with self.session.get(
-                self.full_login_url, headers=headers, allow_redirects=False, timeout=15
-            ) as resp:
-                if resp.status in (302, 301, 401, 403):
-                    return False
-                if resp.status != 200:
-                    return False
-                body = await resp.text()
-                if self._is_forbidden_page(body):
-                    return False
-                # 已登录：页面中不应包含密码输入框
-                has_password = 'type="password"' in body
-                if has_password:
-                    return False
-                # 检查已登录标识
-                logged_in_keywords = ['我的账户', '个人中心', '会员中心', '账户余额', '退出']
-                if any(kw in body for kw in logged_in_keywords):
-                    return True
-                # 无密码字段且无登录标题，认为已登录
-                has_login_title = bool(re.search(r'<title[^>]*>.*?(登录|login).*?</title>', body, re.I))
-                if has_login_title:
-                    return False
-                return True
+            # 优先通过数据域名验证登录状态（用户指明的真实数据页面）
+            verify_targets = [self.full_odds_url]
+            if self.odds_base_url != self.base_url:
+                verify_targets.append(self.full_login_url)
+
+            for target_url in verify_targets:
+                try:
+                    headers = self.get_random_headers()
+                    headers['Accept'] = 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8'
+                    async with self.session.get(
+                        target_url, headers=headers, allow_redirects=False, timeout=15
+                    ) as resp:
+                        if resp.status in (302, 301, 401, 403):
+                            continue
+                        if resp.status != 200:
+                            continue
+                        body = await resp.text()
+                        if self._is_forbidden_page(body):
+                            continue
+                        has_password = 'type="password"' in body
+                        if has_password:
+                            continue
+                        logged_in_keywords = ['我的账户', '个人中心', '会员中心', '账户余额', '退出']
+                        if any(kw in body for kw in logged_in_keywords):
+                            return True
+                        has_login_title = bool(re.search(r'<title[^>]*>.*?(登录|login).*?</title>', body, re.I))
+                        if has_login_title:
+                            continue
+                        return True
+                except Exception:
+                    continue
+
+            return False
         except Exception as e:
             self.logger.warning(f"验证登录状态异常: {str(e)}")
             return False
@@ -237,14 +253,18 @@ class PlatformBParser(BaseSpider):
                     headless=False,
                     args=STABLE_BROWSER_ARGS,
                 )
-                context = await browser.new_context(
-                    user_agent=random.choice(self.user_agents) if self.user_agents else (
+                context_options = {
+                    'user_agent': random.choice(self.user_agents) if self.user_agents else (
                         'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
                         '(KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36'
                     ),
-                    viewport={'width': 1920, 'height': 1080},
-                    locale='zh-CN'
-                )
+                    'viewport': {'width': 1920, 'height': 1080},
+                    'locale': 'zh-CN',
+                }
+                if self.proxy:
+                    context_options['proxy'] = {'server': self.proxy}
+                    self.logger.info(f"登录使用代理: {self.proxy}")
+                context = await browser.new_context(**context_options)
                 await context.add_init_script("""
                     Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
                     Object.defineProperty(navigator, 'plugins', {
@@ -675,6 +695,11 @@ class PlatformBParser(BaseSpider):
                     {cookie['name']: cookie['value']},
                     response_url=URL(self.base_url)
                 )
+                if self.odds_base_url != self.base_url:
+                    self.session.cookie_jar.update_cookies(
+                        {cookie['name']: cookie['value']},
+                        response_url=URL(self.odds_base_url)
+                    )
 
             self._save_cookies(browser_cookies)
             await browser.close()
@@ -740,26 +765,42 @@ class PlatformBParser(BaseSpider):
                     channel='chrome', headless=headless,
                     args=STABLE_BROWSER_ARGS,
                 )
-                context = await browser.new_context(
-                    user_agent=random.choice(self.user_agents) if self.user_agents else (
+                context_options = {
+                    'user_agent': random.choice(self.user_agents) if self.user_agents else (
                         'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
                         '(KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36'
                     ),
-                    viewport={'width': 1920, 'height': 1080}, locale='zh-CN',
-                )
+                    'viewport': {'width': 1920, 'height': 1080},
+                    'locale': 'zh-CN',
+                }
+                if self.proxy:
+                    context_options['proxy'] = {'server': self.proxy}
+                    self.logger.info(f"使用代理: {self.proxy}")
+                context = await browser.new_context(**context_options)
 
-                # 将session中的cookie注入到Playwright
+                # 将session中的cookie注入到Playwright（同时注入登录域和数据域）
                 if self.session:
                     for cookie in self.session.cookie_jar:
+                        base_cookie = {
+                            'name': cookie.key,
+                            'value': cookie.value,
+                            'domain': cookie.get('domain', ''),
+                            'path': cookie.get('path', '/'),
+                        }
                         try:
-                            await context.add_cookies([{
-                                'name': cookie.key,
-                                'value': cookie.value,
-                                'domain': cookie.get('domain', ''),
-                                'path': cookie.get('path', '/'),
-                            }])
+                            await context.add_cookies([base_cookie])
                         except Exception:
                             continue
+                        # 如果数据域名不同，也注入到数据域名
+                        if self.odds_base_url != self.base_url:
+                            try:
+                                from urllib.parse import urlparse
+                                odds_domain = urlparse(self.odds_base_url).hostname
+                                odds_cookie = dict(base_cookie)
+                                odds_cookie['domain'] = odds_domain
+                                await context.add_cookies([odds_cookie])
+                            except Exception:
+                                continue
 
                 page = await context.new_page()
                 page.set_default_timeout(30000)
