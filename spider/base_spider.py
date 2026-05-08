@@ -1012,10 +1012,19 @@ class BaseSpider:
                         self.login_token = cookie['value']
 
                 self.login_cookies = self.session.cookie_jar
-                self.is_logged_in = True
 
-                # 保存cookie到文件以备后续使用
-                self._save_cookies_to_file(browser_cookies)
+                # 检查是否获取到认证token（X-API-TOKEN），避免保存无效cookie
+                if self.login_token:
+                    self.is_logged_in = True
+                    self._save_cookies_to_file(browser_cookies)
+                else:
+                    self.logger.warning(
+                        "Playwright登录后未获取到X-API-TOKEN（可能触发了IP限制页面），"
+                        "保留原有cookie文件不覆盖"
+                    )
+                    self.is_logged_in = False
+                    await browser.close()
+                    return False
 
                 await browser.close()
                 self.logger.info("Playwright登录流程完成，cookie已保存")
