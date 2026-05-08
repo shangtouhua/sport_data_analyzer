@@ -47,7 +47,7 @@ class PlatformAParser(BaseSpider):
 
         # Playwright爬取配置
         pw_scraping = config.get('playwright_scraping', {})
-        self.pw_provider = pw_scraping.get('provider', 'YBTY')
+        self.pw_providers = pw_scraping.get('providers', ['YBTY', 'DBTY', 'IMTY', 'FBTY'])
         self.pw_headless = pw_scraping.get('headless', True)
         self.pw_capture_duration = pw_scraping.get('capture_duration_ms', 15000)
         self.pw_cookie_path = pw_scraping.get('cookie_path', 'data/platform_a_cookies.json')
@@ -81,14 +81,14 @@ class PlatformAParser(BaseSpider):
             self.logger.info(f"数据过滤: sport_type={sport_filter}, market_types={market_filter}")
 
         self.logger.info(
-            f"使用Playwright拦截 [{self.pw_provider}] 数据, "
+            f"使用Playwright拦截提供商: {self.pw_providers}, "
             f"超时: {self.pw_capture_duration}ms"
         )
 
         # 使用IframeDataExtractor通过Playwright捕获数据
         extractor = IframeDataExtractor(self.config, self.logger)
         matches = await extractor.extract_from_page(
-            provider_code=self.pw_provider,
+            provider_codes=self.pw_providers,
             cookie_path=self.pw_cookie_path,
             headless=self.pw_headless,
             capture_duration=self.pw_capture_duration,

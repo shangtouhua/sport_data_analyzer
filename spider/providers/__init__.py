@@ -8,10 +8,16 @@ from typing import Optional, Dict, Any
 
 from .base_provider import BaseProvider
 from .yb_provider import YBTYProvider
+from .panda_provider import DBTYProvider
+from .im_provider import IMTYProvider
+from .fb_provider import FBTYProvider
 
 # 注册所有可用的provider
 AVAILABLE_PROVIDERS = {
     "YBTY": YBTYProvider,
+    "DBTY": DBTYProvider,
+    "IMTY": IMTYProvider,
+    "FBTY": FBTYProvider,
 }
 
 
@@ -28,4 +34,4 @@ def get_all_providers() -> list:
     return [cls() for cls in AVAILABLE_PROVIDERS.values()]
 
 
-__all__ = ["BaseProvider", "YBTYProvider", "AVAILABLE_PROVIDERS", "get_provider", "get_all_providers"]
+__all__ = ["BaseProvider", "YBTYProvider", "DBTYProvider", "IMTYProvider", "FBTYProvider", "AVAILABLE_PROVIDERS", "get_provider", "get_all_providers"]

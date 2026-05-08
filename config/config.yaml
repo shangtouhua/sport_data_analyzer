@@ -24,7 +24,7 @@ spider:
   # Playwright iframe爬取配置（平台A使用iframe加载第三方体育商数据，需浏览器渲染）
   playwright_scraping:
     # 默认使用的第三方体育提供商代码
-    provider: "YBTY"
+    providers: ["YBTY", "DBTY", "IMTY", "FBTY"]
     # 是否无头模式（False可观察浏览器行为用于调试）
     headless: true
     # 导航后等待API响应捕获时间（毫秒）
