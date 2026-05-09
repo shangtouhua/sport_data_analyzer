@@ -66,6 +66,7 @@ class PlatformBParser(BaseSpider):
         self.timeout = platform_config.get('timeout', 30)
         self.full_login_url = f"{self.base_url}/{self.login_api.lstrip('/')}" if self.login_api else f"{self.base_url}/{self.login_url.lstrip('/')}"
         self.full_odds_url = f"{self.odds_base_url}/{self.odds_endpoint.lstrip('/')}"
+        self._playwright_verified_at: float = 0.0
 
     # ==================== 主入口 ====================
 
@@ -114,6 +115,8 @@ class PlatformBParser(BaseSpider):
 
     async def _ensure_login(self) -> bool:
         if self.is_logged_in:
+            if self._playwright_verified_at and (time.time() - self._playwright_verified_at) < 300:
+                return True
             if await self._verify_login_state():
                 return True
             self.is_logged_in = False
@@ -172,20 +175,35 @@ class PlatformBParser(BaseSpider):
                 return False
 
             from yarl import URL
+            loaded_domains = set()
             for cookie in valid_cookies:
                 name = cookie.get('name', '')
                 value = cookie.get('value', '')
-                if name and value:
-                    self.session.cookie_jar.update_cookies(
-                        {name: value},
-                        response_url=URL(self.base_url)
-                    )
-                    # 如果赔率数据域名与登录域名不同，cookie也注入到数据域名
-                    if self.odds_base_url != self.base_url:
+                if not (name and value):
+                    continue
+                # 使用cookie自身的domain，而非统一用base_url
+                cookie_domain = cookie.get('domain', '')
+                if cookie_domain and cookie_domain not in loaded_domains:
+                    # 构造该domain的URL用于cookie注入
+                    domain_url = f"https://{cookie_domain.lstrip('.')}"
+                    try:
                         self.session.cookie_jar.update_cookies(
                             {name: value},
-                            response_url=URL(self.odds_base_url)
+                            response_url=URL(domain_url)
                         )
+                        loaded_domains.add(cookie_domain)
+                    except Exception:
+                        pass
+                # 也注入到base_url和odds_base_url
+                self.session.cookie_jar.update_cookies(
+                    {name: value},
+                    response_url=URL(self.base_url)
+                )
+                if self.odds_base_url != self.base_url:
+                    self.session.cookie_jar.update_cookies(
+                        {name: value},
+                        response_url=URL(self.odds_base_url)
+                    )
 
             self.logger.info(f"已从文件加载 {len(valid_cookies)} 个万博体育cookie"
                              f"{' (已同步到两个域名)' if self.odds_base_url != self.base_url else ''}")
@@ -251,7 +269,7 @@ class PlatformBParser(BaseSpider):
         """使用Playwright自动化登录万博体育（弹窗登录模式）
 
         流程：
-        1. 打开 https://www.yewlwcuj.com:51300/app/index
+        1. 打开 https://cn.fhuhjdsp.com/app/index
         2. 等待登录弹窗出现
         3. 在弹窗中自动填写账号密码
         4. 提交登录
@@ -338,9 +356,9 @@ class PlatformBParser(BaseSpider):
                 ) if msg.type in ('error', 'warning') else None)
                 page.on('pageerror', lambda err: self.logger.error(f"浏览器JS错误: {err}"))
 
-                # 导航到 /app/index（登录弹窗在此页面）
+                # 导航到首页（登录弹窗通过点击"欢迎登录"触发）
                 # 使用 domcontentloaded 替代 networkidle：后者会因 CDN 资源不可达而永久挂起
-                self.logger.info("正在打开万博体育首页 (弹窗登录)...")
+                self.logger.info("正在打开万博体育首页...")
                 try:
                     await page.goto(self.full_login_url, wait_until='domcontentloaded', timeout=30000)
                 except Exception:
@@ -359,6 +377,9 @@ class PlatformBParser(BaseSpider):
                     await self._save_failure_screenshot(page, 'forbidden')
                     await browser.close()
                     return False
+
+                # 点击"欢迎登录"触发登录弹窗
+                await self._trigger_login_popup(page)
 
                 # 等待登录弹窗出现
                 login_popup = await self._wait_for_login_popup(page)
@@ -403,20 +424,38 @@ class PlatformBParser(BaseSpider):
                 # 等待弹窗关闭（登录成功标志）
                 self.logger.info("等待登录弹窗关闭...")
                 if not await self._wait_for_popup_close(page, login_popup):
-                    self.logger.warning("弹窗未自动关闭，尝试手动等待...")
-                    await page.wait_for_timeout(5000)
+                    self.logger.warning("弹窗未自动关闭，尝试手动关闭...")
+                    await self._close_popup_manually(page)
+
+                # 刷新页面以获取登录后的完整状态
+                await page.wait_for_timeout(2000)
+                try:
+                    await page.goto(self.full_login_url, wait_until='domcontentloaded', timeout=15000)
+                    await page.wait_for_timeout(3000)
+                except Exception:
+                    pass
+
+                # 保存截图用于诊断
+                await self._save_failure_screenshot(page, 'after_login')
 
                 # 验证登录状态
                 if await self._check_logged_in_on_index(page):
                     self.logger.info(f"弹窗登录成功，当前URL: {page.url}")
+                    self._playwright_verified_at = time.time()
+                    # 导航到 SPA 页面以获取 API 域名 cookie（mxq01pc.43b8y8.com）
+                    try:
+                        self.logger.info(f"导航到 SPA 页面获取跨域 cookie...")
+                        await page.goto(self.full_odds_url, wait_until='domcontentloaded', timeout=20000)
+                        await page.wait_for_timeout(5000)
+                    except Exception as e:
+                        self.logger.warning(f"SPA 导航失败(不影响登录): {e}")
                     return await self._save_playwright_cookies(context, browser)
 
-                self.logger.error("登录后验证失败，可能登录未成功")
-                if console_errors:
-                    self.logger.warning(f"浏览器控制台错误 ({len(console_errors)}): {console_errors[:10]}")
+                # 即使检查不到登录标识，也尝试保存cookie（可能登录已成功但UI不同）
+                self.logger.warning("未检测到明确登录标识，但仍尝试保存cookie...")
                 await self._save_failure_screenshot(page, 'login_verify_failed')
-                await browser.close()
-                return False
+                # 尝试保存cookie并返回（让后续爬取来判断是否真正登录）
+                return await self._save_playwright_cookies(context, browser)
 
         except ImportError:
             self.logger.error("Playwright 未安装，请运行: pip install playwright && playwright install")
@@ -424,6 +463,27 @@ class PlatformBParser(BaseSpider):
         except Exception as e:
             import traceback
             self.logger.error(f"Playwright弹窗登录失败: {str(e)}\n{traceback.format_exc()}")
+
+    async def _trigger_login_popup(self, page) -> None:
+        """点击页面上的登录入口触发弹窗"""
+        trigger_selectors = [
+            '#wel_login_btn',
+            'a:has-text("欢迎登录")',
+            'a:has-text("登录")',
+            '[onclick*="popupLoginModal"]',
+            '[onclick*="login"]',
+        ]
+        for sel in trigger_selectors:
+            try:
+                el = await page.wait_for_selector(sel, timeout=3000)
+                if el and await el.is_visible():
+                    self.logger.info(f"点击登录触发按钮: {sel}")
+                    await el.click()
+                    await page.wait_for_timeout(2000)
+                    return
+            except Exception:
+                continue
+        self.logger.info("未找到显式登录触发按钮，尝试直接等待弹窗...")
 
     async def _wait_for_login_popup(self, page) -> Optional[Any]:
         """等待登录弹窗出现并返回弹窗元素"""
@@ -457,6 +517,23 @@ class PlatformBParser(BaseSpider):
         """在登录弹窗中仿人填写账号密码，返回密码输入框"""
         username = self.credentials.get('username', '')
         password = self.credentials.get('password', '')
+
+        # 新域名默认显示"手机登录"标签，需先切换到"密码登录"
+        pwd_tab_selectors = [
+            'text=密码登录', '[data-tab="password"]', '.tab-password',
+            'a:has-text("密码登录")', 'li:has-text("密码登录")', 'span:has-text("密码登录")',
+            '.login-tab-item:has-text("密码")',
+        ]
+        for sel in pwd_tab_selectors:
+            try:
+                tab = await page.wait_for_selector(sel, timeout=3000)
+                if tab and await tab.is_visible():
+                    self.logger.info(f"切换到密码登录标签: {sel}")
+                    await tab.click()
+                    await page.wait_for_timeout(1500)
+                    break
+            except Exception:
+                continue
 
         username_selectors = [
             'input[placeholder*="账号" i]', 'input[placeholder*="用户" i]',
@@ -543,26 +620,71 @@ class PlatformBParser(BaseSpider):
             await asyncio.sleep(1)
         return False
 
-    async def _check_logged_in_on_index(self, page) -> bool:
-        """检查 /app/index 页面是否处于已登录状态"""
+    async def _close_popup_manually(self, page) -> None:
+        """手动关闭登录弹窗"""
+        close_selectors = [
+            '.modal .close', '.dialog .close', '.modal-header .close',
+            '[class*="close"]', '.ant-modal-close', '.el-dialog__close',
+            '.layui-layer-close', 'button.close', 'a.close',
+            '[aria-label="Close"]', '[aria-label="关闭"]',
+        ]
+        for sel in close_selectors:
+            try:
+                el = await page.wait_for_selector(sel, timeout=2000)
+                if el and await el.is_visible():
+                    self.logger.info(f"点击关闭按钮: {sel}")
+                    await el.click()
+                    await page.wait_for_timeout(2000)
+                    return
+            except Exception:
+                continue
+
+        # 按 Escape 键
         try:
-            # 已登录状态下不应出现密码输入框
-            pw_input = await page.query_selector('input[type="password"]')
-            if pw_input and await pw_input.is_visible():
-                return False
+            await page.keyboard.press('Escape')
+            self.logger.info("按 Escape 关闭弹窗")
+            await page.wait_for_timeout(2000)
+        except Exception:
+            pass
+
+    async def _check_logged_in_on_index(self, page) -> bool:
+        """检查页面是否处于已登录状态"""
+        try:
+            body_text = await page.evaluate("() => document.body.innerText || ''")
+
+            # 未登录特征：存在"欢迎登录"字样或弹出登录触发
+            if '欢迎登录' in body_text:
+                pw_input = await page.query_selector('input[type="password"]')
+                if pw_input and await pw_input.is_visible():
+                    self.logger.info("检测到密码输入框可见，未登录")
+                    return False
 
             # 检查已登录特征
             logged_in_indicators = [
                 '我的账户', '个人中心', '会员中心', '账户余额',
-                '退出', 'logout', '用户中心',
+                '退出', 'logout', '用户中心', '亲爱的',
+                '用户名', '安全退出',
             ]
-            body_text = await page.evaluate("() => document.body.innerText || ''")
-            for kw in logged_in_indicators:
-                if kw in body_text:
-                    self.logger.info(f"检测到已登录标识: '{kw}'")
-                    return True
+            found = [kw for kw in logged_in_indicators if kw in body_text]
+            if found:
+                self.logger.info(f"检测到已登录标识: {found}")
+                # 确认没有密码输入框
+                pw_input = await page.query_selector('input[type="password"]')
+                if pw_input and await pw_input.is_visible():
+                    self.logger.info("但密码输入框仍可见，可能还在登录弹窗中")
+                    return False
+                return True
+
+            # 检查 URL 是否跳转到首页而非 register 页
+            current_url = page.url
+            if '/home/index' in current_url or current_url.rstrip('/') == self.base_url.rstrip('/'):
+                self.logger.info(f"URL 已跳转至 {current_url}，视为已登录")
+                return True
+
+            self.logger.info(f"未找到登录标识，页面文本前200字符: {body_text[:200]}")
             return False
-        except Exception:
+        except Exception as e:
+            self.logger.debug(f"检查登录状态异常: {e}")
             return False
 
     async def _detect_forbidden_page(self, page) -> bool:
@@ -703,17 +825,18 @@ class PlatformBParser(BaseSpider):
             browser_cookies = await context.cookies()
             self.logger.info(f"获取到 {len(browser_cookies)} 个cookie")
 
-            from yarl import URL
-            for cookie in browser_cookies:
-                self.session.cookie_jar.update_cookies(
-                    {cookie['name']: cookie['value']},
-                    response_url=URL(self.base_url)
-                )
-                if self.odds_base_url != self.base_url:
+            if self.session is not None:
+                from yarl import URL
+                for cookie in browser_cookies:
                     self.session.cookie_jar.update_cookies(
                         {cookie['name']: cookie['value']},
-                        response_url=URL(self.odds_base_url)
+                        response_url=URL(self.base_url)
                     )
+                    if self.odds_base_url != self.base_url:
+                        self.session.cookie_jar.update_cookies(
+                            {cookie['name']: cookie['value']},
+                            response_url=URL(self.odds_base_url)
+                        )
 
             self._save_cookies(browser_cookies)
             await browser.close()
@@ -736,6 +859,9 @@ class PlatformBParser(BaseSpider):
                     'value': c.get('value', ''),
                     'domain': c.get('domain', ''),
                     'path': c.get('path', '/'),
+                    'secure': c.get('secure', False),
+                    'httpOnly': c.get('httpOnly', False),
+                    'sameSite': c.get('sameSite', 'Lax'),
                 }
                 for c in cookies
             ]
@@ -994,7 +1120,7 @@ class PlatformBParser(BaseSpider):
             await page.wait_for_timeout(wait_timeout)
 
             # 检查是否自动捕获到了比赛API响应
-            match_api_responses = [r for r in all_api_responses if '/ai/game/matches' in r.get('url', '')]
+            match_api_responses = [r for r in all_api_responses if '/ai/home/matches' in r.get('url', '') or '/ai/game/matches' in r.get('url', '')]
 
             # ── 策略: 点击体育场馆触发体育模块加载 ──
             # SPA 页面是场馆大厅，需要点击体育场馆入口才会加载比赛数据和 API 调用
@@ -1052,7 +1178,7 @@ class PlatformBParser(BaseSpider):
                         pass
 
                 # 重新检查是否有新捕获的 match API 响应
-                match_api_responses = [r for r in all_api_responses if '/ai/game/matches' in r.get('url', '')]
+                match_api_responses = [r for r in all_api_responses if '/ai/home/matches' in r.get('url', '') or '/ai/game/matches' in r.get('url', '')]
 
             # 如果 SPA 未自动触发比赛API（可能是页面部分加载但体育模块未初始化），
             # 尝试从页面通过 fetch 直接调用 API（仅在页面正常加载时有效）
@@ -1061,17 +1187,14 @@ class PlatformBParser(BaseSpider):
                 from urllib.parse import urlencode
                 api_params = {
                     'groupId': '1', 'gameSort': '1', 'virtualType': '2',
-                    'leagueIds': '', 'pageSize': '40', 'terType': '2',
-                    'gameType': 'FT', 'showtype': 'RB', 'timeStage': '0',
-                    'dateStage': '0', 'onlyFavorite': '0',
+                    'oddsType': 'H',
                 }
                 api_base_url = "https://mxq01pc.43b8y8.com"
 
-                for page_num in range(1, 4):
+                for page_num in range(1, 2):
                     try:
                         params = dict(api_params)
-                        params['page'] = str(page_num)
-                        api_url = f"{api_base_url}/ai/game/matches?{urlencode(params)}"
+                        api_url = f"{api_base_url}/ai/home/matches?{urlencode(params)}"
 
                         import json as _json
                         result = await page.evaluate(f"""
@@ -1110,7 +1233,7 @@ class PlatformBParser(BaseSpider):
                         break
 
                 # 重新检查：fetch 回退是否捕获到了比赛API响应
-                match_api_responses = [r for r in all_api_responses if '/ai/game/matches' in r.get('url', '')]
+                match_api_responses = [r for r in all_api_responses if '/ai/home/matches' in r.get('url', '') or '/ai/game/matches' in r.get('url', '')]
 
             # ── 新增回退: 浏览器直接导航到 API URL ──
             # page.evaluate+fetch 在跨域时可能因 CORS 失败。
@@ -1120,16 +1243,13 @@ class PlatformBParser(BaseSpider):
                 from urllib.parse import urlencode as _urlencode
 
                 api_base_url = "https://mxq01pc.43b8y8.com"
-                for page_num in range(1, 4):
+                for page_num in range(1, 2):
                     try:
                         params = {
                             'groupId': '1', 'gameSort': '1', 'virtualType': '2',
-                            'leagueIds': '', 'pageSize': '40', 'terType': '2',
-                            'gameType': 'FT', 'showtype': 'RB', 'timeStage': '0',
-                            'dateStage': '0', 'onlyFavorite': '0',
+                            'oddsType': 'H',
                         }
-                        params['page'] = str(page_num)
-                        api_url = f"{api_base_url}/ai/game/matches?{_urlencode(params)}"
+                        api_url = f"{api_base_url}/ai/home/matches?{_urlencode(params)}"
 
                         self.logger.info(f"直接导航 API (page={page_num}): {api_url}")
                         response = await page.goto(api_url, wait_until='domcontentloaded', timeout=15000)
@@ -1190,7 +1310,7 @@ class PlatformBParser(BaseSpider):
             with open(os.path.join(diag_dir, f'platform_b_raw_responses_{ts}.json'), 'w', encoding='utf-8') as f:
                 _json.dump(all_api_responses, f, ensure_ascii=False, indent=2, default=str)
             # 单独保存 match API 响应
-            match_only = [r for r in all_api_responses if '/ai/game/matches' in r.get('url', '')]
+            match_only = [r for r in all_api_responses if '/ai/home/matches' in r.get('url', '') or '/ai/game/matches' in r.get('url', '')]
             if match_only:
                 with open(os.path.join(diag_dir, f'platform_b_match_api_{ts}.json'), 'w', encoding='utf-8') as f:
                     _json.dump(match_only, f, ensure_ascii=False, indent=2, default=str)
@@ -1234,7 +1354,7 @@ class PlatformBParser(BaseSpider):
 
     async def _crawl_direct_api(self) -> List[Dict[str, Any]]:
         """
-        直接调用 ai/game/matches API 获取赛事数据（使用 aiohttp）。
+        直接调用 ai/home/matches API 获取赛事数据（使用 aiohttp）。
 
         当 SPA 页面数据无法正常加载时使用此方法。
 
@@ -1258,8 +1378,7 @@ class PlatformBParser(BaseSpider):
 
         api_params = {
             'groupId': '1', 'gameSort': '1', 'virtualType': '2',
-            'leagueIds': '', 'pageSize': '40', 'terType': '2', 'gameType': 'FT',
-            'showtype': 'RB', 'timeStage': '0', 'dateStage': '0', 'onlyFavorite': '0',
+            'oddsType': 'H',
         }
 
         all_matches = []
@@ -1268,49 +1387,45 @@ class PlatformBParser(BaseSpider):
         for api_base in api_base_urls:
             if all_matches:
                 break
-            for page in range(1, 4):
-                try:
-                    params = dict(api_params)
-                    params['page'] = str(page)
-                    from urllib.parse import urlencode
-                    matches_url = f"{api_base}/ai/game/matches?{urlencode(params)}"
+            try:
+                from urllib.parse import urlencode
+                matches_url = f"{api_base}/ai/home/matches?{urlencode(api_params)}"
 
-                    async with self.session.get(
-                        matches_url, headers=headers, timeout=15
-                    ) as resp:
-                        if resp.status != 200:
-                            self.logger.warning(f"API返回HTTP {resp.status}")
-                            if resp.status in (401, 403):
-                                break
-                            continue
+                async with self.session.get(
+                    matches_url, headers=headers, timeout=15
+                ) as resp:
+                    if resp.status != 200:
+                        self.logger.warning(f"API返回HTTP {resp.status}")
+                        if resp.status in (401, 403):
+                            break
+                        continue
 
-                        body = await resp.json()
-                        if isinstance(body, dict):
-                            code_val = body.get('code')
-                            if code_val is not None and code_val != 0 and code_val != 200:
-                                msg = body.get('msg', '')
-                                self.logger.info(f"API业务错误: code={code_val} msg={msg}")
-                                self.logger.warning(f"API业务错误(非200/0): code={code_val} msg={msg}")
-                                break
-
-                        matches = provider.parse_matches_response(body)
-                        if not matches:
-                            self.logger.info(f"第{page}页无比赛数据")
+                    body = await resp.json()
+                    if isinstance(body, dict):
+                        code_val = body.get('code')
+                        if code_val is not None and code_val != 0 and code_val != 200:
+                            msg = body.get('msg', '')
+                            self.logger.info(f"API业务错误: code={code_val} msg={msg}")
                             break
 
-                        for m in matches:
-                            mid = m.get('mid', '')
-                            if mid and mid not in seen_mids:
-                                seen_mids.add(mid)
-                                all_matches.append(m)
+                    matches = provider.parse_matches_response(body)
+                    if not matches:
+                        self.logger.info("无比赛数据")
+                        break
 
-                        self.logger.info(f"第{page}页获取 {len(matches)} 场 (累计 {len(all_matches)})")
+                    for m in matches:
+                        mid = m.get('mid', '')
+                        if mid and mid not in seen_mids:
+                            seen_mids.add(mid)
+                            all_matches.append(m)
 
-                except asyncio.TimeoutError:
-                    self.logger.warning(f"API超时 (page={page})")
-                except Exception as e:
-                    self.logger.warning(f"API异常 (page={page}): {e}")
-                    break
+                    self.logger.info(f"获取 {len(matches)} 场 (累计 {len(all_matches)})")
+
+            except asyncio.TimeoutError:
+                self.logger.warning("API超时")
+            except Exception as e:
+                self.logger.warning(f"API异常: {e}")
+                break
 
         self.logger.info(f"直接API调用完成: {len(all_matches)} 场比赛")
         return all_matches
