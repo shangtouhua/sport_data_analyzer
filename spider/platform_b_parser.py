@@ -2,10 +2,12 @@
 平台B解析器 (万博体育 ManBetX)
 支持 Playwright 浏览器自动化登录 + Cookie 持久化 + 灵活多策略HTML解析。
 
-当前环境IP可能被万博封锁（海外IP返回forbidden页面），代码支持在中国IP环境下正常运行：
+数据获取策略:
 - 优先从文件加载cookie（免登录）
 - cookie失效时使用Playwright自动登录
-- 支持手动登录回退
+- SPA API 拦截（导航 AISports 页面捕获 JSON 响应）
+- 直接 API 调用（aiohttp）
+- Playwright + HTML 解析（兜底）
 """
 
 import asyncio
@@ -20,6 +22,8 @@ from typing import Dict, List, Any, Optional
 from bs4 import BeautifulSoup
 
 from .base_spider import BaseSpider
+
+from .providers.manbetx_provider import ManBetXProvider
 
 
 # 稳定的浏览器启动参数，避免资源加载挂起导致页面无法完整展示
@@ -60,8 +64,6 @@ class PlatformBParser(BaseSpider):
         self.pw_config = platform_config.get('playwright', {})
         self.selectors = platform_config.get('selectors', {})
         self.timeout = platform_config.get('timeout', 30)
-        self.proxy = platform_config.get('proxy', '') or None
-
         self.full_login_url = f"{self.base_url}/{self.login_api.lstrip('/')}" if self.login_api else f"{self.base_url}/{self.login_url.lstrip('/')}"
         self.full_odds_url = f"{self.odds_base_url}/{self.odds_endpoint.lstrip('/')}"
 
@@ -75,19 +77,34 @@ class PlatformBParser(BaseSpider):
             self.logger.info("提示：请确保在中国IP环境下运行，或在浏览器登录后导出cookie")
             return []
 
+        # 策略1: SPA API 拦截（导航到 AISports SPA，自动截获 match API 响应）
+        matches = await self._crawl_spa_api()
+        if matches:
+            self.logger.info(f"SPA API 拦截成功: {len(matches)} 场比赛")
+            return matches
+
+        # 策略2: 直接 API 调用（aiohttp）
+        self.logger.info("SPA 未获取数据，尝试直接 API 调用...")
+        matches = await self._crawl_direct_api()
+        if matches:
+            self.logger.info(f"直接 API 调用成功: {len(matches)} 场比赛")
+            return matches
+
+        # 策略3: Playwright + HTML 解析
+        self.logger.info("API 调用也未获取数据，尝试 HTML 解析...")
         html = await self._fetch_odds_page()
         if not html:
-            self.logger.error("获取赔率页面失败")
+            self.logger.error("获取赔率页面失败 — 所有策略均未获取到数据")
             return []
 
         if self._is_forbidden_page(html):
-            self.logger.error("IP被万博体育封锁（forbidden页面），请使用中国IP或VPN")
+            self.logger.error("IP被万博体育封锁（forbidden页面）")
             return []
 
         try:
             soup = self.parse_html(html)
             matches = self.extract_match_info(soup)
-            self.logger.info(f"成功爬取 {len(matches)} 场比赛数据")
+            self.logger.info(f"HTML 解析: {len(matches)} 场比赛")
             return matches
         except Exception as e:
             self.logger.error(f"解析页面失败: {str(e)}")
@@ -261,9 +278,6 @@ class PlatformBParser(BaseSpider):
                     'viewport': {'width': 1920, 'height': 1080},
                     'locale': 'zh-CN',
                 }
-                if self.proxy:
-                    context_options['proxy'] = {'server': self.proxy}
-                    self.logger.info(f"登录使用代理: {self.proxy}")
                 context = await browser.new_context(**context_options)
                 await context.add_init_script("""
                     Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
@@ -773,9 +787,6 @@ class PlatformBParser(BaseSpider):
                     'viewport': {'width': 1920, 'height': 1080},
                     'locale': 'zh-CN',
                 }
-                if self.proxy:
-                    context_options['proxy'] = {'server': self.proxy}
-                    self.logger.info(f"使用代理: {self.proxy}")
                 context = await browser.new_context(**context_options)
 
                 # 将session中的cookie注入到Playwright（同时注入登录域和数据域）
@@ -841,6 +852,468 @@ class PlatformBParser(BaseSpider):
         except Exception as e:
             self.logger.error(f"Playwright爬取失败: {e}")
             return None
+
+    async def _crawl_spa_api(self) -> List[Dict[str, Any]]:
+        """
+        使用 Playwright 导航到 AISports SPA 页面，拦截内部 API 响应获取赛事数据。
+
+        万博体育的 AISports SPA 加载后会自动调用 mxq01pc.43b8y8.com 的
+        /ai/game/matches API 获取赛事列表。关键依赖:
+        1. 中国IP — 非中国IP会被重定向到 /home/forbidden
+        2. 有效Cookie — 登录态cookie需注入到浏览器上下文
+
+        Returns:
+            标准化赛事数据列表
+        """
+        try:
+            from playwright.async_api import async_playwright
+        except ImportError:
+            self.logger.error("Playwright未安装，无法使用SPA API拦截")
+            return []
+
+        headless = self.pw_config.get('headless', True)
+        wait_timeout = self.pw_config.get('wait_timeout_ms', 20000)
+
+        self.logger.info(f"SPA API拦截模式: {self.full_odds_url}")
+
+        provider = ManBetXProvider(filter_config={
+            'sport_type': self.config.get('playwright_scraping', {}).get('filters', {}).get('sport_type'),
+            'market_types': self.config.get('playwright_scraping', {}).get('filters', {}).get('market_types', []),
+        })
+
+        all_api_responses = []
+
+        async with async_playwright() as pw:
+            browser = await pw.chromium.launch(
+                channel='chrome', headless=headless,
+                args=STABLE_BROWSER_ARGS,
+            )
+            context_options = {
+                'user_agent': random.choice(self.user_agents) if self.user_agents else (
+                    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
+                    '(KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36'
+                ),
+                'viewport': {'width': 1920, 'height': 1080},
+                'locale': 'zh-CN',
+            }
+            context = await browser.new_context(**context_options)
+
+            # 注入cookie到浏览器上下文
+            if self.session:
+                from urllib.parse import urlparse
+                odds_hostname = urlparse(self.odds_base_url).hostname or ''
+                api_domains = ['43b8y8.com', 'mxq01pc.43b8y8.com']
+
+                for cookie in self.session.cookie_jar:
+                    base = {
+                        'name': cookie.key,
+                        'value': cookie.value,
+                        'domain': cookie.get('domain', ''),
+                        'path': cookie.get('path', '/'),
+                    }
+                    # 原始域名
+                    try:
+                        await context.add_cookies([base])
+                    except Exception:
+                        pass
+                    # 数据域名 (cn.fhuhjdsp.com)
+                    if odds_hostname and odds_hostname not in str(base.get('domain', '')):
+                        try:
+                            c = dict(base)
+                            c['domain'] = odds_hostname
+                            await context.add_cookies([c])
+                        except Exception:
+                            pass
+                    # API域名
+                    for api_domain in api_domains:
+                        try:
+                            c = dict(base)
+                            c['domain'] = api_domain
+                            await context.add_cookies([c])
+                        except Exception:
+                            pass
+
+            page = await context.new_page()
+            page.set_default_timeout(60000)
+
+            # 网络响应拦截 - 捕获所有JSON响应（主页面+弹窗页面）
+            all_urls_logged = set()
+
+            async def on_response(response):
+                url = response.url
+                content_type = response.headers.get('content-type', '')
+                if 'json' not in content_type.lower():
+                    return
+                try:
+                    body = await response.json()
+                    if url not in all_urls_logged:
+                        all_urls_logged.add(url)
+                        self.logger.info(f"[SPA拦截] {response.status} {url}")
+                    all_api_responses.append({
+                        'url': url,
+                        'status': response.status,
+                        'body': body,
+                    })
+                except Exception:
+                    pass
+
+            page.on('response', on_response)
+
+            # 监听从场馆点击打开的弹窗/新标签页
+            async def on_new_page(new_page):
+                self.logger.info(f"[SPA拦截] 检测到新页面: {new_page.url}")
+                new_page.on('response', on_response)
+                await new_page.route('**/*', self._block_resource)
+                # 等待新页面加载
+                try:
+                    await new_page.wait_for_load_state('domcontentloaded', timeout=15000)
+                except Exception:
+                    pass
+                await asyncio.sleep(5)  # 等待新页面上的 API 调用
+
+            context.on('page', on_new_page)
+
+            await page.route('**/*', self._block_resource)
+
+            # 导航到 SPA 页面
+            self.logger.info(f"导航到 SPA 页面: {self.full_odds_url}")
+            try:
+                await page.goto(self.full_odds_url, wait_until='domcontentloaded', timeout=30000)
+            except Exception as e:
+                self.logger.warning(f"SPA 页面加载超时: {e}")
+
+            # 检测是否被重定向到 forbidden（IP被拦截的特征）
+            current_url = page.url
+            if 'forbidden' in current_url.lower():
+                self.logger.error(f"SPA页面被重定向到: {current_url}")
+                self.logger.error("IP被万博体育封锁（非中国IP），无法爬取")
+                await browser.close()
+                return []
+
+            self.logger.info(f"等待 SPA 数据加载 ({wait_timeout}ms)...")
+            await page.wait_for_timeout(wait_timeout)
+
+            # 检查是否自动捕获到了比赛API响应
+            match_api_responses = [r for r in all_api_responses if '/ai/game/matches' in r.get('url', '')]
+
+            # ── 策略: 点击体育场馆触发体育模块加载 ──
+            # SPA 页面是场馆大厅，需要点击体育场馆入口才会加载比赛数据和 API 调用
+            if not match_api_responses and 'forbidden' not in current_url.lower():
+                self.logger.info("未自动捕获比赛API，尝试点击体育场馆触发模块加载...")
+                sports_venue_selectors = [
+                    'text=新万博体育-体育',
+                    'text=万博体育',
+                    'text=新亚洲体育',
+                    'text=亚洲体育',
+                    '[class*="sport"]',
+                    '[class*="game-item"]',
+                    '.hall-item',
+                    '.venue-item',
+                ]
+                clicked = False
+                for sel in sports_venue_selectors:
+                    try:
+                        elem = await page.wait_for_selector(sel, timeout=3000)
+                        if elem and await elem.is_visible():
+                            self.logger.info(f"点击体育场馆: {sel}")
+                            await elem.click()
+                            clicked = True
+                            # 等待场馆页面加载和 API 调用
+                            await page.wait_for_timeout(8000)
+                            break
+                    except Exception:
+                        continue
+
+                if not clicked:
+                    # 尝试通过 halls API 数据定位场馆元素
+                    self.logger.info("未找到体育场馆元素，尝试 JS 定位...")
+                    try:
+                        clicked = await page.evaluate("""
+                            () => {
+                                const items = document.querySelectorAll('div, li, a, button');
+                                for (const el of items) {
+                                    const text = el.textContent || '';
+                                    if (text.includes('体育') && !text.includes('彩票') &&
+                                        !text.includes('真人') && !text.includes('电子') &&
+                                        !text.includes('棋牌') && !text.includes('电竞')) {
+                                        if (el.offsetParent !== null) {
+                                            el.click();
+                                            return true;
+                                        }
+                                    }
+                                }
+                                return false;
+                            }
+                        """)
+                        if clicked:
+                            self.logger.info("JS 触发体育场馆点击成功")
+                            await page.wait_for_timeout(8000)
+                    except Exception:
+                        pass
+
+                # 重新检查是否有新捕获的 match API 响应
+                match_api_responses = [r for r in all_api_responses if '/ai/game/matches' in r.get('url', '')]
+
+            # 如果 SPA 未自动触发比赛API（可能是页面部分加载但体育模块未初始化），
+            # 尝试从页面通过 fetch 直接调用 API（仅在页面正常加载时有效）
+            if not match_api_responses and 'forbidden' not in current_url.lower():
+                self.logger.info("自动拦截未捕获比赛API，尝试页内直接调用...")
+                from urllib.parse import urlencode
+                api_params = {
+                    'groupId': '1', 'gameSort': '1', 'virtualType': '2',
+                    'leagueIds': '', 'pageSize': '40', 'terType': '2',
+                    'gameType': 'FT', 'showtype': 'RB', 'timeStage': '0',
+                    'dateStage': '0', 'onlyFavorite': '0',
+                }
+                api_base_url = "https://mxq01pc.43b8y8.com"
+
+                for page_num in range(1, 4):
+                    try:
+                        params = dict(api_params)
+                        params['page'] = str(page_num)
+                        api_url = f"{api_base_url}/ai/game/matches?{urlencode(params)}"
+
+                        import json as _json
+                        result = await page.evaluate(f"""
+                            async () => {{
+                                try {{
+                                    const resp = await fetch({_json.dumps(api_url)}, {{
+                                        credentials: 'include',
+                                        headers: {{ 'Accept': 'application/json, text/plain, */*' }},
+                                    }});
+                                    if (!resp.ok) return {{ error: 'HTTP ' + resp.status }};
+                                    return await resp.json();
+                                }} catch (e) {{
+                                    return {{ error: e.message }};
+                                }}
+                            }}
+                        """)
+
+                        if isinstance(result, dict) and result.get('error'):
+                            self.logger.warning(f"页内API调用失败 (page={page_num}): {result['error']}")
+                            break
+
+                        self.logger.info(f"页内API调用成功 (page={page_num})")
+                        all_api_responses.append({
+                            'url': api_url, 'status': 200, 'body': result,
+                        })
+
+                        if isinstance(result, dict):
+                            code_val = result.get('code')
+                            if code_val is not None and code_val != 0 and code_val != 200:
+                                self.logger.warning(
+                                    f"API返回错误 code={code_val}: {result.get('msg', '')}"
+                                )
+                                break
+                    except Exception as e:
+                        self.logger.warning(f"页内API异常 (page={page_num}): {e}")
+                        break
+
+                # 重新检查：fetch 回退是否捕获到了比赛API响应
+                match_api_responses = [r for r in all_api_responses if '/ai/game/matches' in r.get('url', '')]
+
+            # ── 新增回退: 浏览器直接导航到 API URL ──
+            # page.evaluate+fetch 在跨域时可能因 CORS 失败。
+            # page.goto() 是顶级页面导航，不受 CORS 限制，且浏览器自动携带 cookie。
+            if not match_api_responses and 'forbidden' not in current_url.lower():
+                self.logger.info("页内 fetch 未返回数据，尝试页面导航到 API URL...")
+                from urllib.parse import urlencode as _urlencode
+
+                api_base_url = "https://mxq01pc.43b8y8.com"
+                for page_num in range(1, 4):
+                    try:
+                        params = {
+                            'groupId': '1', 'gameSort': '1', 'virtualType': '2',
+                            'leagueIds': '', 'pageSize': '40', 'terType': '2',
+                            'gameType': 'FT', 'showtype': 'RB', 'timeStage': '0',
+                            'dateStage': '0', 'onlyFavorite': '0',
+                        }
+                        params['page'] = str(page_num)
+                        api_url = f"{api_base_url}/ai/game/matches?{_urlencode(params)}"
+
+                        self.logger.info(f"直接导航 API (page={page_num}): {api_url}")
+                        response = await page.goto(api_url, wait_until='domcontentloaded', timeout=15000)
+
+                        if response and response.status == 200:
+                            import json as _json
+                            body_text = await page.evaluate('document.body.innerText')
+                            if body_text and body_text.strip():
+                                try:
+                                    body = _json.loads(body_text)
+                                    all_api_responses.append({
+                                        'url': api_url, 'status': 200, 'body': body,
+                                    })
+                                    self.logger.info(f"导航API响应获取成功 (page={page_num})")
+                                    if isinstance(body, dict):
+                                        code_val = body.get('code')
+                                        if code_val is not None and code_val != 0 and code_val != 200:
+                                            self.logger.warning(
+                                                f"导航API返回错误 code={code_val}: {body.get('msg', '')}"
+                                            )
+                                            break
+                                    # 短暂随机延时，避免高频触发反爬
+                                    import random as _random
+                                    await page.wait_for_timeout(_random.randint(500, 1500))
+                                    continue
+                                except _json.JSONDecodeError as e:
+                                    self.logger.warning(f"导航API JSON解析失败 (page={page_num}): {e}")
+                                    self.logger.debug(f"原始文本前200字符: {body_text[:200]}")
+                        else:
+                            status = response.status if response else 'N/A'
+                            self.logger.warning(f"导航API返回非200 (page={page_num}, status={status})")
+                    except Exception as e:
+                        self.logger.warning(f"导航API异常 (page={page_num}): {e}")
+                        break
+
+            # 保存截图用于诊断
+            try:
+                diag_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'data', 'diagnosis')
+                os.makedirs(diag_dir, exist_ok=True)
+                ts = __import__('time').strftime('%Y%m%d_%H%M%S')
+                await page.screenshot(path=os.path.join(diag_dir, f'platform_b_spa_{ts}.png'), full_page=False)
+            except Exception:
+                pass
+
+            await browser.close()
+
+        self.logger.info(f"SPA拦截共捕获 {len(all_api_responses)} 个JSON响应")
+
+        if not all_api_responses:
+            return []
+
+        # 保存原始响应用于诊断（使用时间戳文件名，避免覆盖）
+        try:
+            diag_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'data', 'diagnosis')
+            os.makedirs(diag_dir, exist_ok=True)
+            import json as _json
+            ts = datetime.now().strftime('%Y%m%d_%H%M%S')
+            with open(os.path.join(diag_dir, f'platform_b_raw_responses_{ts}.json'), 'w', encoding='utf-8') as f:
+                _json.dump(all_api_responses, f, ensure_ascii=False, indent=2, default=str)
+            # 单独保存 match API 响应
+            match_only = [r for r in all_api_responses if '/ai/game/matches' in r.get('url', '')]
+            if match_only:
+                with open(os.path.join(diag_dir, f'platform_b_match_api_{ts}.json'), 'w', encoding='utf-8') as f:
+                    _json.dump(match_only, f, ensure_ascii=False, indent=2, default=str)
+                self.logger.info(f"match API响应已单独保存, 共 {len(match_only)} 个")
+        except Exception:
+            pass
+
+        # 解析所有捕获的响应
+        all_matches = []
+        seen_mids = set()
+        for resp in all_api_responses:
+            url = resp.get('url', '')
+            body = resp.get('body', {})
+            if not provider.can_handle(url):
+                continue
+
+            matches = provider.parse_matches_response(body)
+            for m in matches:
+                mid = m.get('mid', '')
+                if mid and mid not in seen_mids:
+                    seen_mids.add(mid)
+                    all_matches.append(m)
+
+            # 保存第一个成功的 match API 响应作为样本
+            if matches:
+                sample_dir = os.path.join(
+                    os.path.dirname(os.path.dirname(__file__)),
+                    'data', 'sample_responses', 'MANBETX'
+                )
+                try:
+                    os.makedirs(sample_dir, exist_ok=True)
+                    ts = datetime.now().strftime('%Y%m%d_%H%M%S')
+                    ManBetXProvider.save_sample_response(
+                        body, os.path.join(sample_dir, f'matches_{ts}.json')
+                    )
+                except Exception:
+                    pass
+
+        self.logger.info(f"SPA API 解析完成: {len(all_matches)} 场比赛 (去重后)")
+        return all_matches
+
+    async def _crawl_direct_api(self) -> List[Dict[str, Any]]:
+        """
+        直接调用 ai/game/matches API 获取赛事数据（使用 aiohttp）。
+
+        当 SPA 页面数据无法正常加载时使用此方法。
+
+        Returns:
+            标准化赛事数据列表
+        """
+        api_base_urls = ["https://mxq01pc.43b8y8.com"]
+
+        provider = ManBetXProvider(filter_config={
+            'sport_type': self.config.get('playwright_scraping', {}).get('filters', {}).get('sport_type'),
+            'market_types': self.config.get('playwright_scraping', {}).get('filters', {}).get('market_types', []),
+        })
+
+        headers = self.get_random_headers()
+        headers.update({
+            'Accept': 'application/json, text/plain, */*',
+            'Referer': f'{self.odds_base_url}/sports/AISports?isWindow=true',
+            'Origin': self.odds_base_url,
+            'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
+        })
+
+        api_params = {
+            'groupId': '1', 'gameSort': '1', 'virtualType': '2',
+            'leagueIds': '', 'pageSize': '40', 'terType': '2', 'gameType': 'FT',
+            'showtype': 'RB', 'timeStage': '0', 'dateStage': '0', 'onlyFavorite': '0',
+        }
+
+        all_matches = []
+        seen_mids = set()
+
+        for api_base in api_base_urls:
+            if all_matches:
+                break
+            for page in range(1, 4):
+                try:
+                    params = dict(api_params)
+                    params['page'] = str(page)
+                    from urllib.parse import urlencode
+                    matches_url = f"{api_base}/ai/game/matches?{urlencode(params)}"
+
+                    async with self.session.get(
+                        matches_url, headers=headers, timeout=15
+                    ) as resp:
+                        if resp.status != 200:
+                            self.logger.warning(f"API返回HTTP {resp.status}")
+                            if resp.status in (401, 403):
+                                break
+                            continue
+
+                        body = await resp.json()
+                        if isinstance(body, dict):
+                            code_val = body.get('code')
+                            if code_val is not None and code_val != 0 and code_val != 200:
+                                msg = body.get('msg', '')
+                                self.logger.info(f"API业务错误: code={code_val} msg={msg}")
+                                self.logger.warning(f"API业务错误(非200/0): code={code_val} msg={msg}")
+                                break
+
+                        matches = provider.parse_matches_response(body)
+                        if not matches:
+                            self.logger.info(f"第{page}页无比赛数据")
+                            break
+
+                        for m in matches:
+                            mid = m.get('mid', '')
+                            if mid and mid not in seen_mids:
+                                seen_mids.add(mid)
+                                all_matches.append(m)
+
+                        self.logger.info(f"第{page}页获取 {len(matches)} 场 (累计 {len(all_matches)})")
+
+                except asyncio.TimeoutError:
+                    self.logger.warning(f"API超时 (page={page})")
+                except Exception as e:
+                    self.logger.warning(f"API异常 (page={page}): {e}")
+                    break
+
+        self.logger.info(f"直接API调用完成: {len(all_matches)} 场比赛")
+        return all_matches
 
     async def _block_resource(self, route):
         """拦截非必要资源（图片/字体/媒体），CSS仍放行以保证页面渲染"""

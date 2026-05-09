@@ -11,6 +11,7 @@ from .yb_provider import YBTYProvider
 from .panda_provider import DBTYProvider
 from .im_provider import IMTYProvider
 from .fb_provider import FBTYProvider
+from .manbetx_provider import ManBetXProvider
 
 # 注册所有可用的provider
 AVAILABLE_PROVIDERS = {
@@ -18,6 +19,7 @@ AVAILABLE_PROVIDERS = {
     "DBTY": DBTYProvider,
     "IMTY": IMTYProvider,
     "FBTY": FBTYProvider,
+    "MANBETX": ManBetXProvider,
 }
 
 

@@ -91,7 +91,7 @@ spider:
       name: "万博体育"
       base_url: "https://www.yewlwcuj.com:51300"
       # 赔率数据页面URL（登录后跳转的域名，cookie与base_url共用）
-      odds_base_url: "https://cn.fhuhjdsp.com"
+      odds_base_url: "https://cn.fhuhjdsp.com/"
       login_url: "/app/index"
       login_api: ""
       # 登录弹窗配置（万博体育在/app/index页面弹出登录对话框）
@@ -110,7 +110,7 @@ spider:
       login_verify_endpoint: ""
       login_verify_header: "Cookie"
       odds_endpoint: "/sports/AISports?isWindow=true"
-      # HTTP代理配置（万博限制海外IP，需使用中国IP代理或VPN）
+      # HTTP代理配置（当前环境为中国IP时无需代理）
       # 支持格式: http://host:port 或 socks5://host:port
       proxy: ""
       timeout: 30
@@ -154,6 +154,18 @@ spider:
         headless: true
         wait_selector: "div.match-list, table.match-table, .sports-table, div[class*='match']"
         wait_timeout_ms: 15000
+      # SPA API 拦截配置（直接捕获单页应用内部API响应，无需解析HTML）
+      spa_api_interception:
+        enabled: true
+        # SPA加载后等待API响应返回的时间（毫秒）
+        capture_timeout_ms: 20000
+        # 要拦截的API URL匹配模式
+        api_patterns:
+          - "/ai/game/matches"
+          - "/ai/queryCond/queryConditionRB"
+        # 是否自动翻页获取更多数据
+        auto_paginate: true
+        max_pages: 5
 
 # 赛事匹配配置
 matching:

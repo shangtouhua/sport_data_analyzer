@@ -1,25 +1,7 @@
 [
     {
-        "name": "TRACK-HOUR",
-        "value": "10",
-        "domain": "www.uompld.vip",
-        "path": "/user"
-    },
-    {
         "name": "X-API-UUID",
-        "value": "796efbb8-e132-4974-b4f5-22b530f46481",
-        "domain": "www.uompld.vip",
-        "path": "/"
-    },
-    {
-        "name": "captcha_v4_user",
-        "value": "202fcd53d2214f12a4f281e5efc46e38",
-        "domain": "bcaptcha.botion.com",
-        "path": "/"
-    },
-    {
-        "name": "X-API-TOKEN",
-        "value": "d50b57d7515fcacad2ae53736302ffbab4865deb44e6898d6145ef166dc505ef35444d819db49d85792e5ff125906b68",
+        "value": "f746e0b3-e86a-47e3-92a5-3e2fb68259ce",
         "domain": "www.uompld.vip",
         "path": "/"
     }
